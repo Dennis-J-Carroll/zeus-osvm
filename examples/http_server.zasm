@@ -1,0 +1,73 @@
+; http_server.zasm - tiny HTTP server on port 8080
+
+.data
+port:       .word 8080
+backlog:    .word 5
+client_fd:  .word 0
+strlen_len: .word 0
+
+response:
+    .asciz "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nHello, Zeus!\n"
+
+.code
+start:
+    SOCK_TCP
+    DUP
+    PUSH port
+    LOADI
+    BIND
+    JZ bind_ok
+    POP
+    HALT
+bind_ok:
+    DUP
+    PUSH backlog
+    LOADI
+    LISTEN
+    JZ listen_ok
+    POP
+    HALT
+listen_ok:
+    ACCEPT
+    PUSH client_fd
+    STOREI
+    PUSH client_fd
+    LOADI
+
+    ; send response
+    PUSH response
+    CALL call_strlen
+    PUSH response
+    SWAP
+    SEND
+    POP
+
+    PUSH client_fd
+    LOADI
+    CLOSE
+    POP
+    HALT
+
+; strlen(addr) -> length
+; consumes address, returns length on stack
+call_strlen:
+    PUSH 0
+    STORE strlen_len
+strlen_loop:
+    DUP
+    LOADBI
+    JZ strlen_done
+    PUSH strlen_len
+    LOADI
+    PUSH 1
+    ADD
+    PUSH strlen_len
+    STOREI
+    PUSH 1
+    ADD
+    JMP strlen_loop
+strlen_done:
+    POP
+    PUSH strlen_len
+    LOADI
+    RET

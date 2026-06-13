@@ -1,0 +1,59 @@
+; echo_server.zasm - TCP echo server on port 12345
+
+.data
+port:       .word 12345
+backlog:    .word 5
+client_fd:  .word 0
+recv_count: .word 0
+buf:        .org 1024
+
+.code
+start:
+    SOCK_TCP
+    DUP
+    PUSH port
+    LOADI
+    BIND
+    JZ bind_ok
+    POP
+    HALT
+bind_ok:
+    DUP
+    PUSH backlog
+    LOADI
+    LISTEN
+    JZ listen_ok
+    POP
+    HALT
+listen_ok:
+    ACCEPT
+    PUSH client_fd
+    STOREI
+
+loop:
+    PUSH client_fd
+    LOADI
+    PUSH buf
+    PUSH 1024
+    RECV
+    DUP
+    JZ recv_done
+
+    PUSH recv_count
+    STOREI
+
+    PUSH client_fd
+    LOADI
+    PUSH buf
+    PUSH recv_count
+    LOADI
+    SEND
+    POP                 ; discard sent byte count
+    JMP loop
+recv_done:
+    POP                 ; discard 0 recv result
+    PUSH client_fd
+    LOADI
+    CLOSE
+    POP
+    HALT

@@ -1,0 +1,22 @@
+; hello.zasm - print a greeting
+
+.data
+msg:
+    .asciz "Hello, Zeus_osVM!\n"
+
+.code
+start:
+    PUSH msg
+loop:
+    DUP
+    LOADBI
+    DUP
+    JZ done
+    PRINTC
+    PUSH 1
+    ADD
+    JMP loop
+done:
+    POP
+    POP
+    HALT

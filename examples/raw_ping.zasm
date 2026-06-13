@@ -1,0 +1,51 @@
+; raw_ping.zasm - allocate and send a raw IP/ICMP echo request
+; Requires root or CAP_NET_RAW to actually transmit.
+
+.data
+payload:
+    .asciz "Zeus"
+
+.code
+start:
+    ; Allocate a 40-byte packet buffer (20 IP + 20 payload/ICMP)
+    PUSH 40
+    RAW_ALLOC
+    DUP
+    STORE pkt_id
+
+    ; Set IP protocol to ICMP (1)
+    PUSH 1
+    SWAP
+    RAW_SET_PROTO
+    POP
+
+    ; Set destination to 127.0.0.1 (0x0100007F little-endian)
+    PUSH 0x0100007F
+    PUSH pkt_id
+    LOADI
+    RAW_SET_DST
+    POP
+
+    ; Copy payload into packet buffer
+    PUSH 5                  ; strlen("Zeus") + 1
+    PUSH payload
+    PUSH pkt_id
+    LOADI
+    RAW_SET_PAYLOAD
+    POP
+
+    ; Send it (iface 0 means default)
+    PUSH 0
+    PUSH pkt_id
+    LOADI
+    RAW_SEND
+    PRINT                   ; print bytes sent, or -1 on error
+
+    PUSH pkt_id
+    LOADI
+    RAW_FREE
+    POP
+
+    HALT
+
+pkt_id: .word 0
