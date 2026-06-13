@@ -6,6 +6,7 @@ Stack-based VM in C for experimenting with networking concepts. Builds `zeus` (V
 
 - Build: `make` (produces `zeus`, `zasm`, `zdis`)
 - Test: `make test`
+- Smoke test: `make smoke` (builds + runs `./smoke_test.sh` end-to-end against all examples)
 - Clean: `make clean` (also removes `examples/*.zeus` and the `zasm`/`zdis` wrappers)
 
 ## CLI (src/main.c)
