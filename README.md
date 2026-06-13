@@ -85,4 +85,4 @@ See `include/isa.h` for the full instruction set. Common opcodes:
 
 ## License
 
-Public domain / do whatever you want with it. Have fun!
+MIT — see [`LICENSE`](LICENSE). Have fun!
