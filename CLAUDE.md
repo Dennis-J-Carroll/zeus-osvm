@@ -1,4 +1,6 @@
-# Agent Notes for Zeus_osVM
+# CLAUDE.md — Zeus_osVM
+
+Stack-based VM in C for experimenting with networking concepts. Builds `zeus` (VM + CLI), `zasm` (assembler wrapper), `zdis` (disassembler wrapper).
 
 ## Build & Test
 
@@ -17,7 +19,7 @@ zeus dis prog.zeus            # disassemble bytecode
 zeus run-asm in.zasm          # assemble + run in one step
 ```
 
-`zasm` and `zdis` are generated shell wrappers that `exec ./zeus asm` / `./zeus dis`. They are recreated by `make` and deleted by `make clean`.
+`zasm` and `zdis` are generated shell wrappers (see Makefile) that `exec ./zeus asm` / `./zeus dis`. They are recreated by `make` and deleted by `make clean`.
 
 ## Project Layout
 
@@ -41,6 +43,7 @@ zeus run-asm in.zasm          # assemble + run in one step
 - 64-bit signed integer stack words
 - Opcode bytes are defined in `include/isa.h`; metadata in `src/isa.c`
 - VM memory layout: program data copied to address 0 at load time; rest is runtime heap/stack
+- Separate operand and call stacks, flat runtime memory, BSD-sockets networking layer
 
 ## Adding New Instructions
 
@@ -66,6 +69,6 @@ Raw packet opcodes create IP-layer raw sockets. On Linux this requires `CAP_NET_
 
 `make` builds all three binaries; `make test` passes 7/7. `hello`, `echo_server`, `http_server`, `boot_splash` examples run; `raw_ping` needs `CAP_NET_RAW`/root.
 
-## Note on CLAUDE.md
+## Note on AGENTS.md
 
-`CLAUDE.md` holds the same notes for Claude Code. Both files are maintained independently — **update both when changing build/layout/conventions** to avoid drift.
+`AGENTS.md` holds the same notes for other agent tools. Both files are maintained independently — **update both when changing build/layout/conventions** to avoid drift.
