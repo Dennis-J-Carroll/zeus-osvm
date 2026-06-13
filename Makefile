@@ -7,7 +7,7 @@ OBJS := $(SRCS:.c=.o)
 
 TARGET := zeus
 
-.PHONY: all clean test
+.PHONY: all clean test smoke
 
 all: $(TARGET) zasm zdis
 
@@ -29,6 +29,9 @@ test: $(TARGET)
 	$(CC) $(CFLAGS) -o tests/test_asm tests/test_asm.c $(filter-out src/main.o,$(OBJS)) $(LDFLAGS)
 	./tests/test_vm
 	./tests/test_asm
+
+smoke: all
+	./smoke_test.sh
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
