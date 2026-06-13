@@ -20,6 +20,11 @@ make
 
 This produces `zeus`, `zasm`, and `zdis`.
 
+## Documentation
+
+Full usage guide — CLI, assembly language, complete opcode reference, worked
+examples, and networking — in [`docs/USAGE.md`](docs/USAGE.md).
+
 ## Quick Start
 
 Assemble and run the hello example:

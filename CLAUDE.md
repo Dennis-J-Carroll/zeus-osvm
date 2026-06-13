@@ -22,6 +22,10 @@ zeus run-asm in.zasm          # assemble + run in one step
 
 `zasm` and `zdis` are generated shell wrappers (see Makefile) that `exec ./zeus asm` / `./zeus dis`. They are recreated by `make` and deleted by `make clean`.
 
+## Docs
+
+`docs/USAGE.md` — comprehensive usage + full opcode reference (verified against source). `README.md` for the human overview.
+
 ## Project Layout
 
 - `include/` - public C headers
