@@ -1,9 +1,9 @@
 """MO command-line entry point.
 
-    mo eval <spec.py> <trace.jsonl>
+    mo eval <spec.zspec|spec.py> <trace.jsonl>
 
-M0 loads the spec as a Python module that defines a module-level `spec`
-(a rules.Spec). The .zspec text parser arrives in M1 and will slot in here
+`.zspec` files are parsed by the M1 text parser. `.py` files (M0 form) are
+imported and must define a module-level `spec` (a rules.Spec). Both resolve
 behind the same `load_spec` call.
 
 Exit code: 0 if the session is clean, 1 if any BOLTED or CONDEMNED verdict
@@ -21,6 +21,11 @@ from .trace import read_jsonl
 
 
 def load_spec(path: str) -> Spec:
+    if path.endswith(".zspec"):
+        from .parser import parse_file
+        return parse_file(path)
+
+    # .py fallback: a module that defines a module-level `spec`
     spec_module = importlib.util.spec_from_file_location("_mo_spec", path)
     if spec_module is None or spec_module.loader is None:
         raise ValueError(f"cannot load spec from {path}")
@@ -32,7 +37,7 @@ def load_spec(path: str) -> Spec:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) != 3 or argv[0] != "eval":
-        print("usage: mo eval <spec.py> <trace.jsonl>", file=sys.stderr)
+        print("usage: mo eval <spec.zspec|spec.py> <trace.jsonl>", file=sys.stderr)
         return 2
 
     _, spec_path, trace_path = argv

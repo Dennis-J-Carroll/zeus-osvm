@@ -192,10 +192,27 @@ Decisions locked while building M0:
 - **BOLT `closed_at` = notice-time** (the event ts that revealed the lapse), not the
   exact lapse instant. Revisit at M4 if reports need lapse-time.
 
-**M1 — Spec parser.** Replace the hand-built rule objects with a real .zspec
-parser (the `OBSERVE/EXPECT/WINDOW/ASSERT` grammar). Keep it line-oriented like
-your existing zasm parser.
-*Exit:* specs are text files, not Python.
+**M1 — Spec parser. ✅ DONE.** `mo/parser.py` turns `.zspec` text into the same
+TriggerRule/AssertRule objects — engine/ledger/report untouched. Line-oriented
+with assembler-style `line N:` errors. `cli.load_spec` dispatches on extension
+(`.zspec` → parse, `.py` → import, back-compat). 22 tests pass.
+*Exit met:* `mo eval mo/examples/every_tool_honored.zspec <trace>` runs the §9
+demo from a text spec; `spec_line` in verdicts points at real source lines.
+
+Grammar v0 (locked, deliberately small per premortem #3):
+```
+; comment to end of line
+on <primitive> as $<bind>:
+    EXPECT <primitive> for $<bind>
+    WINDOW <ms>
+
+ASSERT no <primitiveA> where identifier not in <primitiveB>
+```
+- `on ... as $x:` IS the OBSERVE primitive (block form from §3's worked example).
+  One EXPECT + one WINDOW per block; binding `$x` must match across `on`/`EXPECT`.
+- ASSERT v0 is **membership-only**. The "set" is a primitive's seen-identifiers
+  (what `engine.seen` already tracks) — no named-set indirection like
+  `declared_tools`. Equality/boolean forms deferred until something real needs them.
 
 **M2 — Adapter for MCP.** Write the protocol adapter that turns the existing tap
 session logs (`from_mcp_session()` already exists!) into a ZeusEvent stream. This

@@ -1,0 +1,8 @@
+; Every declared tool must actually be called within 5s,
+; and no tool may be called that was never declared.
+
+on tool_declared as $tool:          ; OBSERVE a declaration
+    EXPECT tool_called for $tool     ; open a liveness obligation
+    WINDOW 5000                      ; ...that bolts after 5s
+
+ASSERT no tool_called where identifier not in tool_declared   ; -> CONDEMNED
