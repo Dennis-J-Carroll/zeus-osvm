@@ -1,0 +1,4 @@
+{"primitive": "tool_declared", "identifier": "search", "ts": 0.0}
+{"primitive": "tool_declared", "identifier": "fetch", "ts": 100.0}
+{"primitive": "tool_called", "identifier": "search", "payload": {"q": "olympus"}, "ts": 1200.0}
+{"primitive": "tool_called", "identifier": "fetch", "payload": {"url": "x"}, "ts": 3400.0}
