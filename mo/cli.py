@@ -36,13 +36,23 @@ def load_spec(path: str) -> Spec:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    mcp = "--mcp" in argv
+    argv = [a for a in argv if a != "--mcp"]
     if len(argv) != 3 or argv[0] != "eval":
-        print("usage: mo eval <spec.zspec|spec.py> <trace.jsonl>", file=sys.stderr)
+        print("usage: mo eval [--mcp] <spec.zspec|spec.py> <trace.jsonl>",
+              file=sys.stderr)
         return 2
 
     _, spec_path, trace_path = argv
     spec = load_spec(spec_path)
-    result = run(read_jsonl(trace_path), spec)
+    if mcp:
+        # --mcp: the file is a Glassport tap session, not a ZeusEvent log.
+        # Lazy import keeps the protocol lib out of MO's core import graph.
+        from .adapters.mcp import from_mcp_session_file
+        events = from_mcp_session_file(trace_path)
+    else:
+        events = read_jsonl(trace_path)
+    result = run(events, spec)
 
     for line in jsonl_lines(result):
         print(line)

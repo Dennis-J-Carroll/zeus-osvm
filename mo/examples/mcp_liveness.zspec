@@ -1,0 +1,9 @@
+; MCP session policy:
+;   1. every tool call must return a result within 10s (liveness)
+;   2. no tool may be called that the server never declared (fabrication)
+
+on tool_called as $tool:
+    EXPECT tool_result for $tool
+    WINDOW 10000
+
+ASSERT no tool_called where identifier not in tool_declared   ; -> CONDEMNED

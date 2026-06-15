@@ -1,6 +1,9 @@
 import json
+import os
 
 from mo.cli import load_spec, main
+
+_EX = os.path.join(os.path.dirname(__file__), "..", "examples")
 
 
 SPEC_SRC = '''
@@ -54,6 +57,23 @@ def test_eval_with_zspec_runs_end_to_end(tmp_path, capsys):
 
     assert code == 1
     assert '"kind": "BOLTED"' in out
+
+
+def test_eval_mcp_flag_routes_session_through_adapter(capsys):
+    import pytest
+    pytest.importorskip("glassport")
+
+    spec = os.path.join(_EX, "mcp_liveness.zspec")
+    session = os.path.join(_EX, "mcp_session.jsonl")
+
+    code = main(["eval", "--mcp", spec, session])
+    out = capsys.readouterr().out
+
+    assert code == 1   # the fabricated arxiv_lookup condemns the session
+    condemned = [json.loads(l) for l in out.splitlines()
+                 if l.startswith("{") and json.loads(l)["kind"] == "CONDEMNED"]
+    assert len(condemned) == 1
+    assert condemned[0]["identifier"] == "arxiv_lookup"
 
 
 def test_eval_clean_session_exits_zero(tmp_path, capsys):
