@@ -12,5 +12,6 @@ from dataclasses import dataclass, field
 class ZeusEvent:
     primitive: str               # "tool_declared", "tool_called", "send", ...
     identifier: str | None       # binding key, e.g. tool name
+    correlation: str | None = field(default=None, kw_only=True)  # instance id
     payload: dict = field(default_factory=dict)
     ts: float = 0.0              # monotonic ms; time only ever advances via events

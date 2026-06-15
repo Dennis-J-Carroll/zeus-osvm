@@ -167,3 +167,45 @@ def test_eval_bolted_session_exits_nonzero_with_one_bolt(tmp_path, capsys):
     assert len(bolts) == 1
     assert json.loads(bolts[0])["identifier"] == "search"
     assert code == 1
+
+
+def test_eval_prints_zspec_parse_error_cleanly(tmp_path, capsys):
+    bad = tmp_path / "bad.zspec"
+    bad.write_text("on tool_declared as $t\n    EXPECT tool_called for $t\n")
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text('{"primitive":"tool_declared","identifier":"x","ts":0.0}\n')
+
+    code = main(["eval", str(bad), str(trace)])
+    err = capsys.readouterr().err
+
+    assert code == 2
+    assert "mo:" in err
+    assert "line" in err.lower()
+
+
+def test_watch_prints_zspec_parse_error_cleanly(tmp_path, capsys):
+    bad = tmp_path / "bad.zspec"
+    bad.write_text("ASSERT no tool_called where identifier not in\n")
+    session = tmp_path / "s.jsonl"
+    session.write_text("")
+
+    code = main(["watch", str(bad), str(session)])
+    err = capsys.readouterr().err
+
+    assert code == 2
+    assert "mo:" in err
+    assert "line" in err.lower()
+
+
+def test_report_prints_zspec_parse_error_cleanly(tmp_path, capsys):
+    bad = tmp_path / "bad.zspec"
+    bad.write_text("on tool_declared\n")
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text('{"primitive":"tool_declared","identifier":"x","ts":0.0}\n')
+
+    code = main(["report", str(bad), str(trace)])
+    err = capsys.readouterr().err
+
+    assert code == 2
+    assert "mo:" in err
+    assert "line" in err.lower()

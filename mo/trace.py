@@ -21,6 +21,7 @@ def read_jsonl(path: str) -> Iterator[ZeusEvent]:
             yield ZeusEvent(
                 primitive=obj["primitive"],
                 identifier=obj.get("identifier"),
+                correlation=obj.get("correlation"),
                 payload=obj.get("payload", {}),
                 ts=float(obj.get("ts", 0.0)),
             )

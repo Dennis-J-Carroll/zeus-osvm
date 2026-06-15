@@ -152,3 +152,69 @@ def test_real_mcp_session_through_mo_yields_expected_verdicts():
     assert kinds.count("BOLTED") == 0
     condemned = next(v for v in result.verdicts if v.kind == "CONDEMNED")
     assert condemned.identifier == "arxiv_lookup"
+
+
+def test_frame_projector_keeps_concurrent_same_tool_calls_separate():
+    # premortem #2 live variant: two calls to the same tool, results returned
+    # in reverse order. Correlation by jsonrpc id must pair each result with
+    # its own call, not the first still-open call.
+    project = frame_projector()
+    records = [
+        {"dir": "c2s", "ts": "2026-06-09T18:39:29.100000+00:00",
+         "frame": {"id": 1, "method": "tools/call",
+                   "params": {"name": "search", "arguments": {"q": "a"}}}},
+        {"dir": "c2s", "ts": "2026-06-09T18:39:29.200000+00:00",
+         "frame": {"id": 2, "method": "tools/call",
+                   "params": {"name": "search", "arguments": {"q": "b"}}}},
+        # result for id 2 arrives BEFORE result for id 1
+        {"dir": "s2c", "ts": "2026-06-09T18:39:29.300000+00:00",
+         "frame": {"id": 2, "result": {"content": []}}},
+        {"dir": "s2c", "ts": "2026-06-09T18:39:29.400000+00:00",
+         "frame": {"id": 1, "result": {"content": []}}},
+    ]
+
+    evs = list(frames_to_events(records))
+    results = [(e.primitive, e.identifier, e.correlation) for e in evs]
+
+    assert results == [
+        ("tool_called", "search", "1"),
+        ("tool_called", "search", "2"),
+        ("tool_result", "search", "2"),
+        ("tool_result", "search", "1"),
+    ]
+
+
+def test_frame_projector_survives_malformed_tool_call():
+    # missing params, missing name, missing id — the projector must not crash
+    # and should still surface something for coverage.
+    records = [
+        {"dir": "c2s", "ts": "2026-06-09T18:39:29.100000+00:00",
+         "frame": {"id": 1, "method": "tools/call"}},   # no params
+        {"dir": "c2s", "ts": "2026-06-09T18:39:29.200000+00:00",
+         "frame": {"id": 2, "method": "tools/call",
+                   "params": {"arguments": {}}}},        # no name
+        {"dir": "c2s", "ts": "2026-06-09T18:39:29.300000+00:00",
+         "frame": {"method": "tools/call",
+                   "params": {"name": "x"}}},            # no id
+    ]
+
+    evs = list(frames_to_events(records))
+
+    assert all(e.primitive == "tool_called" for e in evs)
+    assert [e.identifier for e in evs] == [None, None, "x"]
+    assert [e.correlation for e in evs] == ["1", "2", None]
+
+
+def test_frame_projector_survives_result_without_matching_call():
+    # a result with an unknown id is not correlated; it surfaces as a generic
+    # frame so the session is still judged rather than silently dropped.
+    records = [
+        {"dir": "s2c", "ts": "2026-06-09T18:39:29.300000+00:00",
+         "frame": {"id": 99, "result": {"content": []}}},
+    ]
+
+    evs = list(frames_to_events(records))
+
+    assert len(evs) == 1
+    assert evs[0].primitive == "response"
+    assert evs[0].identifier is None

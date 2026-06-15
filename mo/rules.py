@@ -25,13 +25,16 @@ class TriggerRule:
         return ev.primitive == self.on_primitive
 
     def make_obligation(self, ev: ZeusEvent) -> Obligation:
-        # the firing event's identifier ($tool) ties declaration to execution
+        # the firing event's identifier ($tool) ties declaration to execution;
+        # its correlation id (if any) keeps concurrent calls to the same tool
+        # from cross-closing (premortem #2).
         return Obligation(
             identifier=ev.identifier,
             expects=self.expects,
             opened_at=ev.ts,
             expires_at=ev.ts + self.window_ms,
             spec_line=self.spec_line,
+            correlation=ev.correlation,
         )
 
 

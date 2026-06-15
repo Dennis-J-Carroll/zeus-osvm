@@ -15,6 +15,7 @@ class Obligation:
     opened_at: float
     expires_at: float            # opened_at + window
     spec_line: int
+    correlation: str | None = None   # instance id carried from trigger event
     state: str = "open"          # "open" | "fulfilled" | "bolted"
 
 

@@ -71,6 +71,12 @@ def _result_is_error(event) -> bool:
     return False
 
 
+def _correlation(event) -> str | None:
+    meta = getattr(event, "metadata", None) or {}
+    cid = meta.get("jsonrpc_id")
+    return str(cid) if cid is not None else None
+
+
 def trace_to_events(trace) -> Iterator[ZeusEvent]:
     events = list(getattr(trace, "events", []))
     first_ts = min((_to_ms(e) for e in events), default=0.0)
@@ -81,15 +87,18 @@ def trace_to_events(trace) -> Iterator[ZeusEvent]:
 
     for e in events:
         ts = _to_ms(e)
+        corr = _correlation(e)
         if e.kind == _KIND_TOOL_CALL:
             yield ZeusEvent("tool_called", _tool_call_name(e),
+                            correlation=corr,
                             payload={"arguments": _tool_call_args(e)}, ts=ts)
         elif e.kind == _KIND_TOOL_RESULT:
             name = (getattr(e, "metadata", None) or {}).get("tool_name")
             yield ZeusEvent("tool_result", name,
+                            correlation=corr,
                             payload={"is_error": _result_is_error(e)}, ts=ts)
         else:
-            yield ZeusEvent(str(e.kind), None, payload={}, ts=ts)
+            yield ZeusEvent(str(e.kind), None, correlation=corr, payload={}, ts=ts)
 
 
 def _rec_ms(rec: dict) -> float:
@@ -130,9 +139,12 @@ def frame_projector():
         if direction == "c2s" and method == "tools/call":
             params = frame.get("params") or {}
             name = params.get("name")
-            if "id" in frame:
-                pending[frame["id"]] = name
+            cid = frame.get("id")
+            corr = str(cid) if cid is not None else None
+            if cid is not None:
+                pending[cid] = name
             yield ZeusEvent("tool_called", name,
+                            correlation=corr,
                             payload={"arguments": params.get("arguments", {})},
                             ts=ts)
         elif isinstance(result, dict) and isinstance(result.get("tools"), list):
@@ -141,8 +153,10 @@ def frame_projector():
                     yield ZeusEvent("tool_declared", tool["name"],
                                     payload={}, ts=ts)
         elif isinstance(result, dict) and frame.get("id") in pending:
-            name = pending.pop(frame["id"])
+            cid = frame["id"]
+            name = pending.pop(cid)
             yield ZeusEvent("tool_result", name,
+                            correlation=str(cid),
                             payload={"is_error": bool(result.get("isError"))},
                             ts=ts)
         else:

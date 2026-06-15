@@ -91,7 +91,13 @@ python3 -m mo report spec.zspec trace.jsonl -o out.html  # self-contained HTML t
 
 ## Verified Working
 
-`make` builds all three binaries; `make test` passes 7/7. `hello`, `echo_server`, `http_server`, `boot_splash` examples run; `raw_ping` needs `CAP_NET_RAW`/root. MO: `python3 -m pytest mo/` passes 44/44.
+`make` builds all three binaries; `make test` passes 7/7. `make smoke` passes 8/8. `hello`, `echo_server`, `http_server`, `boot_splash` examples run; `raw_ping` needs `CAP_NET_RAW`/root. MO: `python3 -m pytest mo/` passes 53/53.
+
+Recent additions:
+- Correlation ids: `ZeusEvent` and `Obligation` carry a `correlation` field so
+  concurrent calls to the same tool close the right obligation (premortem #2).
+- Live dogfood verified: `glassport wrap -- python3 fake_server.py` + `mo watch`
+  on the growing tap log produced one `FULFILLED` verdict and no deviations.
 
 ## Note on AGENTS.md
 

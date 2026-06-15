@@ -29,24 +29,30 @@ class RunResult:
 
 
 def _bolt(ob: Obligation, closed_at: float, reason: str) -> Verdict:
+    detail = {"window_ms": ob.expires_at - ob.opened_at, "reason": reason}
+    if ob.correlation is not None:
+        detail["correlation"] = ob.correlation
     return Verdict(
         kind="BOLTED",
         identifier=ob.identifier,
         spec_line=ob.spec_line,
         opened_at=ob.opened_at,
         closed_at=closed_at,
-        detail={"window_ms": ob.expires_at - ob.opened_at, "reason": reason},
+        detail=detail,
     )
 
 
 def _fulfill(ob: Obligation, closed_at: float) -> Verdict:
+    detail = {}
+    if ob.correlation is not None:
+        detail["correlation"] = ob.correlation
     return Verdict(
         kind="FULFILLED",
         identifier=ob.identifier,
         spec_line=ob.spec_line,
         opened_at=ob.opened_at,
         closed_at=closed_at,
-        detail={},
+        detail=detail,
     )
 
 
@@ -104,9 +110,16 @@ def iter_verdicts(stream, spec: Spec, stats: RunResult | None = None):
         # b) satisfy any open obligation this event closes
         for ob in ledger.open_obligations():
             if ev.primitive == ob.expects and ev.identifier == ob.identifier:
+                # correlation-aware matching (premortem #2): if either side has
+                # an instance id, they must agree exactly. When neither has one,
+                # fall back to first-match by identifier (the M0/M1 behavior).
+                if (ob.correlation is not None or ev.correlation is not None) \
+                        and ev.correlation != ob.correlation:
+                    continue
                 ledger.close(ob, "fulfilled")
                 yield _fulfill(ob, ev.ts)
                 matched = True
+                break
 
         # c) safety: does this event violate an ASSERT?
         for rule in spec.assertions:

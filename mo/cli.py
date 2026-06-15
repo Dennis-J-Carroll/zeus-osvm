@@ -18,6 +18,7 @@ import sys
 import time
 
 from .engine import RunResult, iter_verdicts, run
+from .parser import ParseError
 from .report import human_summary, jsonl_lines, render_html, verdict_to_dict
 from .rules import Spec
 from .trace import read_jsonl
@@ -132,37 +133,49 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     cmd, rest = argv[0], argv[1:]
 
-    if cmd == "eval":
-        mcp = "--mcp" in rest
-        rest = [a for a in rest if a != "--mcp"]
-        if len(rest) != 2:
-            print(_USAGE, file=sys.stderr)
-            return 2
-        return _eval(rest[0], rest[1], mcp)
+    try:
+        if cmd == "eval":
+            mcp = "--mcp" in rest
+            rest = [a for a in rest if a != "--mcp"]
+            if len(rest) != 2:
+                print(_USAGE, file=sys.stderr)
+                return 2
+            return _eval(rest[0], rest[1], mcp)
 
-    if cmd == "watch":
-        idle_ms: float | None = None
-        if "--idle-ms" in rest:
-            i = rest.index("--idle-ms")
-            idle_ms = float(rest[i + 1])
-            rest = rest[:i] + rest[i + 2:]
-        if len(rest) != 2:
-            print(_USAGE, file=sys.stderr)
-            return 2
-        return _watch(rest[0], rest[1], idle_ms)
+        if cmd == "watch":
+            idle_ms: float | None = None
+            if "--idle-ms" in rest:
+                i = rest.index("--idle-ms")
+                idle_ms = float(rest[i + 1])
+                rest = rest[:i] + rest[i + 2:]
+            if len(rest) != 2:
+                print(_USAGE, file=sys.stderr)
+                return 2
+            return _watch(rest[0], rest[1], idle_ms)
 
-    if cmd == "report":
-        mcp = "--mcp" in rest
-        rest = [a for a in rest if a != "--mcp"]
-        out_path: str | None = None
-        if "-o" in rest:
-            i = rest.index("-o")
-            out_path = rest[i + 1]
-            rest = rest[:i] + rest[i + 2:]
-        if len(rest) != 2:
-            print(_USAGE, file=sys.stderr)
-            return 2
-        return _report(rest[0], rest[1], mcp, out_path)
+        if cmd == "report":
+            mcp = "--mcp" in rest
+            rest = [a for a in rest if a != "--mcp"]
+            out_path: str | None = None
+            if "-o" in rest:
+                i = rest.index("-o")
+                out_path = rest[i + 1]
+                rest = rest[:i] + rest[i + 2:]
+            if len(rest) != 2:
+                print(_USAGE, file=sys.stderr)
+                return 2
+            return _report(rest[0], rest[1], mcp, out_path)
+    except FileNotFoundError as exc:
+        print(f"mo: {exc}", file=sys.stderr)
+        return 2
+    except ParseError as exc:
+        # .zspec text parser emits line N: errors; surface them cleanly.
+        print(f"mo: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        # includes import failures from load_spec and bad numeric flags
+        print(f"mo: {exc}", file=sys.stderr)
+        return 2
 
     print(_USAGE, file=sys.stderr)
     return 2

@@ -48,6 +48,9 @@ def tail_events(
     least `tick_ms` has elapsed on `clock`, one tick is emitted. The loop ends
     when `stop()` returns True or — if `idle_ms` is set — when that much time
     has passed since the last line was read (the tapped process went quiet).
+
+    Malformed JSON lines are skipped: a crashing server may write a truncated
+    frame, but the tailer must stay alive to judge whatever follows.
     """
     last_tick = last_line = clock()
     with open(path, encoding="utf-8") as fh:
@@ -56,7 +59,13 @@ def tail_events(
             line = fh.readline()
             if line.endswith("\n"):
                 last_line = clock()
-                yield from project(json.loads(line))
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    # truncated/corrupt line mid-write — leave it behind and
+                    # continue tailing so later complete frames are still judged.
+                    continue
+                yield from project(rec)
                 continue
             # no complete line right now — rewind over any partial read
             fh.seek(pos)

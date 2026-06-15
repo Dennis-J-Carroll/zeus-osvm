@@ -78,3 +78,27 @@ def test_live_tailer_is_protocol_agnostic():
     # the seam: the generic tailer must not drag in glassport or the MCP adapter
     import mo.adapters.live  # noqa: F401
     assert "glassport" not in sys.modules
+
+
+def test_tail_skips_truncated_jsonl_line(tmp_path):
+    # a crashing server can leave a partial line in the tap log; the tailer must
+    # not die, and must still process the next complete line.
+    from mo.adapters.live import tail_events
+
+    p = tmp_path / "s.jsonl"
+    p.write_text('{"x": 1' + '\n{"x": 2}\n')   # first line is truncated
+
+    clocks = iter([0.0, 0.0, 0.0])
+    stops = iter([False, False, False, True])
+
+    def project(rec):
+        yield ZeusEvent("log", str(rec.get("x")), ts=0.0)
+
+    evs = list(tail_events(
+        str(p), project=project, tick_ms=1000,
+        clock=lambda: next(clocks, 0.0),
+        sleep=lambda *_: None,
+        stop=lambda: next(stops, True),
+    ))
+
+    assert [e.identifier for e in evs] == ["2"]

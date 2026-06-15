@@ -222,3 +222,51 @@ def test_unmatched_events_counted_for_coverage():
 
     assert result.total_events == 3
     assert result.unmatched_events == 1
+
+
+def test_concurrent_same_tool_results_close_matching_obligation():
+    # premortem #2: two concurrent calls to the same tool must not cross-close.
+    # Only the result carrying the same correlation id fulfills its obligation;
+    # the other call is still unresolved and BOLTs at end of stream.
+    spec = Spec(triggers=[
+        TriggerRule(on_primitive="tool_called", expects="tool_result",
+                    window_ms=5000, spec_line=1),
+    ])
+    stream = [
+        ZeusEvent("tool_called", "search", correlation="a", ts=0.0),
+        ZeusEvent("tool_called", "search", correlation="b", ts=10.0),
+        # result for call "a" arrives first; it must NOT close call "b"
+        ZeusEvent("tool_result", "search", correlation="a", ts=20.0),
+    ]
+
+    result = run(stream, spec)
+
+    fulfilled = [v for v in result.verdicts if v.kind == "FULFILLED"]
+    bolted = [v for v in result.verdicts if v.kind == "BOLTED"]
+    assert len(fulfilled) == 1
+    assert fulfilled[0].identifier == "search"
+    assert fulfilled[0].detail.get("correlation") == "a"
+    assert len(bolted) == 1
+    assert bolted[0].identifier == "search"
+    assert bolted[0].detail.get("correlation") == "b"
+
+
+def test_correlation_absent_falls_back_to_identifier_match():
+    # Obligations/events created without a correlation id still match by
+    # identifier alone, preserving M0/M1 replay compatibility.
+    spec = Spec(triggers=[
+        TriggerRule(on_primitive="tool_called", expects="tool_result",
+                    window_ms=5000, spec_line=1),
+    ])
+    stream = [
+        ZeusEvent("tool_called", "search", ts=0.0),
+        ZeusEvent("tool_called", "search", ts=10.0),
+        ZeusEvent("tool_result", "search", ts=20.0),
+    ]
+
+    result = run(stream, spec)
+
+    fulfilled = [v for v in result.verdicts if v.kind == "FULFILLED"]
+    bolted = [v for v in result.verdicts if v.kind == "BOLTED"]
+    assert len(fulfilled) == 1
+    assert len(bolted) == 1
