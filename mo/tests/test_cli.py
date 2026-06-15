@@ -115,6 +115,28 @@ def test_watch_bolts_a_silent_unanswered_call_mid_session(tmp_path):
     assert printed and printed[0]["kind"] == "BOLTED"
 
 
+def test_report_writes_self_contained_html(tmp_path):
+    spec = tmp_path / "live.zspec"
+    spec.write_text(
+        "on tool_declared as $t:\n"
+        "    EXPECT tool_called for $t\n"
+        "    WINDOW 5000\n"
+    )
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        json.dumps({"primitive": "tool_declared", "identifier": "x",
+                    "payload": {}, "ts": 0.0}) + "\n"
+    )   # declared, never called -> end-of-stream BOLT -> a deviation
+    out = tmp_path / "report.html"
+
+    code = main(["report", str(spec), str(trace), "-o", str(out)])
+
+    assert code == 1   # the unhonored declaration deviates
+    page = out.read_text()
+    assert page.lstrip().startswith("<!DOCTYPE html>")
+    assert "BOLTED" in page and "DEVIATIONS FOUND" in page
+
+
 def test_eval_clean_session_exits_zero(tmp_path, capsys):
     spec = _write_spec(tmp_path)
     trace = tmp_path / "trace.jsonl"

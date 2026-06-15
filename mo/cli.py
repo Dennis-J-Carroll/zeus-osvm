@@ -18,7 +18,7 @@ import sys
 import time
 
 from .engine import RunResult, iter_verdicts, run
-from .report import human_summary, jsonl_lines, verdict_to_dict
+from .report import human_summary, jsonl_lines, render_html, verdict_to_dict
 from .rules import Spec
 from .trace import read_jsonl
 
@@ -94,10 +94,34 @@ def _watch(spec_path: str, session_path: str, idle_ms: float | None) -> int:
     return 1 if deviations else 0
 
 
+def _report(spec_path: str, trace_path: str, mcp: bool, out_path: str | None) -> int:
+    spec = load_spec(spec_path)
+    if mcp:
+        from .adapters.mcp import from_mcp_session_file
+        events = from_mcp_session_file(trace_path)
+    else:
+        events = read_jsonl(trace_path)
+    result = run(events, spec)
+
+    import os
+    page = render_html(result, title=os.path.basename(trace_path))
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(page)
+        print(f"wrote {out_path}", file=sys.stderr)
+    else:
+        print(page)
+    print(human_summary(result), file=sys.stderr)
+
+    deviations = sum(1 for v in result.verdicts if v.kind in ("BOLTED", "CONDEMNED"))
+    return 1 if deviations else 0
+
+
 _USAGE = (
     "usage:\n"
-    "  mo eval  [--mcp] <spec.zspec|spec.py> <trace.jsonl>\n"
-    "  mo watch [--idle-ms N] <spec.zspec|spec.py> <session.jsonl>"
+    "  mo eval   [--mcp] <spec.zspec|spec.py> <trace.jsonl>\n"
+    "  mo watch  [--idle-ms N] <spec.zspec|spec.py> <session.jsonl>\n"
+    "  mo report [--mcp] <spec.zspec|spec.py> <trace.jsonl> [-o out.html]"
 )
 
 
@@ -126,6 +150,19 @@ def main(argv: list[str] | None = None) -> int:
             print(_USAGE, file=sys.stderr)
             return 2
         return _watch(rest[0], rest[1], idle_ms)
+
+    if cmd == "report":
+        mcp = "--mcp" in rest
+        rest = [a for a in rest if a != "--mcp"]
+        out_path: str | None = None
+        if "-o" in rest:
+            i = rest.index("-o")
+            out_path = rest[i + 1]
+            rest = rest[:i] + rest[i + 2:]
+        if len(rest) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _report(rest[0], rest[1], mcp, out_path)
 
     print(_USAGE, file=sys.stderr)
     return 2

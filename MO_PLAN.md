@@ -251,10 +251,28 @@ Decisions locked while building M3:
   so "read the proxy stream in real time" became *tail the growing tap log* —
   the testable, dogfoodable seam. A `-- <cmd>` launcher can wrap it later.
 
-**M4 — Report.** Human-readable session report (reuse the M3 HTML report idea
-from Glassport): a timeline with BOLTs marked, fulfilled obligations in green,
-condemnations in red.
-*Exit:* one artifact you can show someone.
+**M4 — Report. ✅ DONE.** `report.render_html(result)` draws a self-contained,
+no-JS, offline HTML timeline: FULFILLED green spans, BOLTED amber spans,
+CONDEMNED red point-markers, over a linear-time axis, under a CLEAN/DEVIATIONS
+banner with the coverage signal. `mo report [--mcp] <spec> <trace> [-o out.html]`.
+44 tests pass.
+*Exit met:* one artifact you can show someone — generated for the §9 fabrication
+session (2 green + 1 red) and the hung-server session (1 amber BOLT).
+
+Decisions locked while building M4:
+- **Every identifier is HTML-escaped** before it touches the page (matches the
+  Glassport report's discipline). A hostile server can name a tool
+  `<img onerror=...>` and the report opens from `file://` where injected script
+  runs with local reach — so wire strings render as text, never markup. A test
+  pins this with a live XSS-shaped identifier.
+- **Linear time scale** (`_span_geometry`): x is proportional to real elapsed
+  ms, so a BOLT's window genuinely looks wide and clustered calls sit close. The
+  alternative (even per-event spacing) loses real durations; revisit if dense
+  sessions get unreadable.
+- **CONDEMNED is a point marker, not a span** — it has no `opened_at`, so it
+  renders at its instant (width 0, red left-border) rather than a bar.
+- **Zero dependencies, single string** — no template engine, inline CSS, opens
+  on a phone. Consistent with the Glassport family and MO's no-C-import rule.
 
 ---
 
