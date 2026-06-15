@@ -1,7 +1,8 @@
+import io
 import json
 import os
 
-from mo.cli import load_spec, main
+from mo.cli import load_spec, main, watch
 
 _EX = os.path.join(os.path.dirname(__file__), "..", "examples")
 
@@ -74,6 +75,44 @@ def test_eval_mcp_flag_routes_session_through_adapter(capsys):
                  if l.startswith("{") and json.loads(l)["kind"] == "CONDEMNED"]
     assert len(condemned) == 1
     assert condemned[0]["identifier"] == "arxiv_lookup"
+
+
+def test_watch_bolts_a_silent_unanswered_call_mid_session(tmp_path):
+    # the M3 demo: a live session calls a tool and the server goes quiet. A
+    # synthetic tick must cross the window and BOLT mid-silence — not wait for
+    # end-of-stream. Clock is injected so the silence is deterministic.
+    spec_path = tmp_path / "live.zspec"
+    spec_path.write_text(
+        "on tool_called as $t:\n"
+        "    EXPECT tool_result for $t\n"
+        "    WINDOW 5000\n"
+    )
+    session = tmp_path / "s.jsonl"
+    session.write_text(json.dumps({
+        "dir": "c2s", "seq": 1,
+        "frame": {"id": 5, "method": "tools/call",
+                  "params": {"name": "search", "arguments": {}}},
+    }) + "\n")   # ...and then nothing. the server never answers.
+
+    # init=0, read@0, poll@6000 (>5001 -> tick bolts), poll@200000 (idle stop)
+    clocks = iter([0.0, 0.0, 6000.0, 200000.0])
+    out = io.StringIO()
+
+    result = watch(
+        load_spec(str(spec_path)), str(session),
+        tick_ms=100, idle_ms=100000,
+        clock=lambda: next(clocks, 200000.0),
+        sleep=lambda *_: None, out=out,
+    )
+
+    kinds = [v.kind for v in result.verdicts]
+    assert kinds == ["BOLTED"]
+    bolt = result.verdicts[0]
+    assert bolt.identifier == "search"
+    assert bolt.detail["reason"] == "liveness_window_expired"  # the tick, not EOS
+    # the verdict was streamed to stdout the moment it fired
+    printed = [json.loads(l) for l in out.getvalue().splitlines() if l.strip()]
+    assert printed and printed[0]["kind"] == "BOLTED"
 
 
 def test_eval_clean_session_exits_zero(tmp_path, capsys):

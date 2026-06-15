@@ -61,35 +61,57 @@ def _condemn(ev, rule) -> Verdict:
     )
 
 
-def run(stream, spec: Spec) -> RunResult:
+def iter_verdicts(stream, spec: Spec, stats: RunResult | None = None):
+    """The judge as a generator: yield each Verdict the moment it is decided.
+
+    This is the one evaluation loop. `run()` drains it into a RunResult for
+    batch/replay; `mo watch` consumes it lazily so a live session prints a BOLT
+    the instant a window lapses rather than at session end. Coverage counters
+    can't ride along in the verdict yield, so a caller wanting them passes a
+    RunResult as `stats` and the loop updates it in place.
+    """
     ledger = ObligationLedger()
-    result = RunResult()
     seen: dict = defaultdict(set)   # primitive -> set of identifiers observed
     last_ts = 0.0
 
     for ev in stream:
-        result.total_events += 1
         last_ts = ev.ts
+
+        # a tick is a pure time carrier (premortem #1, the silence problem):
+        # it only advances the clock so open windows can expire during silence.
+        # It is NOT a wire event — it never fulfills, condemns, or triggers, and
+        # it stays out of the coverage denominator (premortem #5) so a quiet
+        # live session does not read as "all blind". The wall clock that mints
+        # ticks lives in the adapter; the engine still only reads ev.ts (#6).
+        if ev.primitive == "tick":
+            for ob in ledger.open_obligations():
+                if ev.ts > ob.expires_at:
+                    ledger.close(ob, "bolted")
+                    yield _bolt(ob, ev.ts, "liveness_window_expired")
+            continue
+
+        if stats is not None:
+            stats.total_events += 1
         seen[ev.primitive].add(ev.identifier)
         matched = False
 
         # a) expire first, against THIS event's timestamp (deterministic)
         for ob in ledger.open_obligations():
             if ev.ts > ob.expires_at:
-                result.verdicts.append(_bolt(ob, ev.ts, "liveness_window_expired"))
                 ledger.close(ob, "bolted")
+                yield _bolt(ob, ev.ts, "liveness_window_expired")
 
         # b) satisfy any open obligation this event closes
         for ob in ledger.open_obligations():
             if ev.primitive == ob.expects and ev.identifier == ob.identifier:
-                result.verdicts.append(_fulfill(ob, ev.ts))
                 ledger.close(ob, "fulfilled")
+                yield _fulfill(ob, ev.ts)
                 matched = True
 
         # c) safety: does this event violate an ASSERT?
         for rule in spec.assertions:
             if rule.violated_by(ev, seen):
-                result.verdicts.append(_condemn(ev, rule))
+                yield _condemn(ev, rule)
                 matched = True
 
         # d) does this event TRIGGER new obligations?
@@ -98,12 +120,16 @@ def run(stream, spec: Spec) -> RunResult:
                 ledger.open(rule.make_obligation(ev))
                 matched = True
 
-        if not matched:
-            result.unmatched_events += 1
+        if not matched and stats is not None:
+            stats.unmatched_events += 1
 
     # e) end of stream: every still-open obligation is a BOLT
     for ob in ledger.open_obligations():
-        result.verdicts.append(_bolt(ob, last_ts, "session_ended_unresolved"))
         ledger.close(ob, "bolted")
+        yield _bolt(ob, last_ts, "session_ended_unresolved")
 
+
+def run(stream, spec: Spec) -> RunResult:
+    result = RunResult()
+    result.verdicts = list(iter_verdicts(stream, spec, stats=result))
     return result

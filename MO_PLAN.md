@@ -219,10 +219,37 @@ session logs (`from_mcp_session()` already exists!) into a ZeusEvent stream. Thi
 is where MO meets your existing Glassport work.
 *Exit:* feed a real captured MCP session through MO, get verdicts.
 
-**M3 — Live mode.** Adapter reads the proxy stream in real time instead of a
-file. The expire-against-event-ts logic needs a synthetic "tick" event so windows
-can expire during silence.
-*Exit:* `mo watch --spec x.zspec -- <mcp server cmd>` judges a live server.
+**M3 — Live mode. ✅ DONE.** MO tails a *growing* glassport session log and
+judges it in real time, minting a synthetic `tick` so liveness windows expire
+during silence (premortem #1). `mo watch [--idle-ms N] <spec> <session.jsonl>`
+streams verdicts to stdout the instant each fires. 40 tests pass.
+*Exit met:* a hung server (calls a tool, never answers) yields exactly one BOLT
+with reason `liveness_window_expired` — proven on both a static log and a file
+appended-to live while MO tails it.
+
+Decisions locked while building M3:
+- **`tick` is a first-class Zeus primitive,** recognized by the engine
+  (`engine.py`): it advances the clock and expires windows but never fulfills,
+  condemns, triggers, or counts toward coverage (premortem #5). "Time passed" is
+  protocol-agnostic, so this doesn't breach the adapter seam (#4).
+- **The wall clock lives in the adapter, never the engine.** `adapters/live.py`
+  reads `time.time()` to mint ticks; the engine still only reads `ev.ts`, so
+  replay determinism (#6) is preserved by construction. clock/sleep/stop are
+  injectable so the tick logic is deterministically testable without real time.
+- **Tick ts is on the same scale as frame ts (epoch ms)** so `ev.ts >
+  expires_at` is meaningful. Default tick granularity **100ms** (premortem #1).
+- **One evaluation loop, two faces:** `iter_verdicts()` is the generator;
+  `run()` drains it into a RunResult for replay, `watch()` consumes it lazily so
+  a BOLT prints mid-session, not at end-of-stream.
+- **Live projection is WIRE ORDER** (`frame_projector`), not declarations-up-
+  front like the batch `--mcp` path: live can't pre-scan the session. This means
+  the membership ASSERT is racy against a late `tools/list` (premortem #2's
+  cousin), so the M3 demo spec is liveness-only. Wire-order fabrication checks
+  wait for a correlation/declaration-aware ASSERT (M4+).
+- **Departed from the literal `-- <mcp server cmd>` exit line:** glassport's tap
+  writes a JSONL file (no push API) and needs a real client to drive the server,
+  so "read the proxy stream in real time" became *tail the growing tap log* —
+  the testable, dogfoodable seam. A `-- <cmd>` launcher can wrap it later.
 
 **M4 — Report.** Human-readable session report (reuse the M3 HTML report idea
 from Glassport): a timeline with BOLTs marked, fulfilled obligations in green,

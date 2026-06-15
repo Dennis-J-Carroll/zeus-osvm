@@ -1,0 +1,8 @@
+; Live liveness policy: every tool call must return a result within 5s.
+; Used by `mo watch` — the silence problem (premortem #1) is exactly this:
+; if the server is called and then goes quiet, a synthetic tick must cross
+; the window and BOLT, even though no further wire event ever arrives.
+
+on tool_called as $tool:
+    EXPECT tool_result for $tool
+    WINDOW 5000

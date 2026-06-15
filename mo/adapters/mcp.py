@@ -92,6 +92,73 @@ def trace_to_events(trace) -> Iterator[ZeusEvent]:
             yield ZeusEvent(str(e.kind), None, payload={}, ts=ts)
 
 
+def _rec_ms(rec: dict) -> float:
+    ts = rec.get("ts") or ""
+    if ts:
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(ts).timestamp() * 1000.0
+        except ValueError:
+            pass
+    seq = rec.get("seq")
+    return float(seq) if seq is not None else 0.0
+
+
+def frame_projector():
+    """A stateful single-record projector for live mode.
+
+    Returns `project(record) -> Iterator[ZeusEvent]`. The live tailer feeds one
+    glassport JSONL record at a time, so the call->result id correlation must
+    persist across calls — it lives in the closure's `pending` map, not in a
+    per-call local. Projection is WIRE ORDER: a declaration surfaces when the
+    tools/list *response* crosses, a call when it crosses, a result when it
+    returns. Unrecognized frames still surface as a generic event (identifier
+    None) so nothing is silently dropped and coverage (premortem #5) stays
+    honest.
+    """
+    pending: dict = {}   # request id -> tool name, for result correlation
+
+    def project(rec: dict) -> Iterator[ZeusEvent]:
+        frame = rec.get("frame")
+        if not isinstance(frame, dict):
+            return   # raw / unparsed wire line; the tap logs it, MO skips it
+        ts = _rec_ms(rec)
+        direction = rec.get("dir")
+        method = frame.get("method")
+        result = frame.get("result")
+
+        if direction == "c2s" and method == "tools/call":
+            params = frame.get("params") or {}
+            name = params.get("name")
+            if "id" in frame:
+                pending[frame["id"]] = name
+            yield ZeusEvent("tool_called", name,
+                            payload={"arguments": params.get("arguments", {})},
+                            ts=ts)
+        elif isinstance(result, dict) and isinstance(result.get("tools"), list):
+            for tool in result["tools"]:
+                if isinstance(tool, dict) and "name" in tool:
+                    yield ZeusEvent("tool_declared", tool["name"],
+                                    payload={}, ts=ts)
+        elif isinstance(result, dict) and frame.get("id") in pending:
+            name = pending.pop(frame["id"])
+            yield ZeusEvent("tool_result", name,
+                            payload={"is_error": bool(result.get("isError"))},
+                            ts=ts)
+        else:
+            label = method or ("response" if result is not None else "frame")
+            yield ZeusEvent(str(label), None, payload={}, ts=ts)
+
+    return project
+
+
+def frames_to_events(records: Iterable[dict]) -> Iterator[ZeusEvent]:
+    """Batch face of `frame_projector`: project a whole record sequence."""
+    project = frame_projector()
+    for rec in records:
+        yield from project(rec)
+
+
 def from_mcp_session(log_lines: Iterable[str], **kw) -> Iterator[ZeusEvent]:
     from glassport.adapters.mcp_session import from_mcp_session as _gp
     return trace_to_events(_gp(log_lines, **kw))
