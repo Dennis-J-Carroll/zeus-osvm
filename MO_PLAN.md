@@ -266,9 +266,12 @@ Decisions locked while building M4:
   runs with local reach — so wire strings render as text, never markup. A test
   pins this with a live XSS-shaped identifier.
 - **Linear time scale** (`_span_geometry`): x is proportional to real elapsed
-  ms, so a BOLT's window genuinely looks wide and clustered calls sit close. The
-  alternative (even per-event spacing) loses real durations; revisit if dense
-  sessions get unreadable.
+  ms, so a BOLT's window genuinely looks wide and clustered calls sit close.
+  **KNOWN LIMITATION:** on a dense session — many calls milliseconds apart next
+  to one multi-second BOLT — the fast calls collapse to a sliver and the report
+  reads badly. The fix is per-event (even-lane) spacing with true durations in
+  tooltips, ~6 lines isolated in `_span_geometry`. Left linear until a real
+  dense session proves it unreadable; swap is local and test-pinned.
 - **CONDEMNED is a point marker, not a span** — it has no `opened_at`, so it
   renders at its instant (width 0, red left-border) rather than a bar.
 - **Zero dependencies, single string** — no template engine, inline CSS, opens
