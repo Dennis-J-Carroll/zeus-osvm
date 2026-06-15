@@ -70,9 +70,28 @@ Raw packet opcodes create IP-layer raw sockets. On Linux this requires `CAP_NET_
 - **Networking is single-threaded + blocking.** No select/poll loop yet.
 - **Sockets:** both `SOCK_TCP` and `SOCK_UDP` (`0x71`) opcodes exist; README only highlights TCP.
 
+## MO — spec runner (Python sibling)
+
+`mo/` is a Python package that judges agent behavior against a `.zspec`; it
+**never imports the C VM**. Verdicts: `FULFILLED`, `BOLTED` (liveness window
+lapsed), `CONDEMNED` (safety assertion broke). Design in `MO_PLAN.md`.
+
+```bash
+python3 -m mo eval   spec.zspec trace.jsonl              # replay a recorded ZeusEvent stream
+python3 -m mo eval   --mcp spec.zspec session.jsonl      # replay a captured Glassport MCP tap log
+python3 -m mo watch  spec.zspec session.jsonl            # judge a growing tap log live (synthetic ticks expire silent windows)
+python3 -m mo report spec.zspec trace.jsonl -o out.html  # self-contained HTML timeline
+```
+
+- Verdicts as JSONL on stdout, human summary on stderr; exit `1` if any
+  BOLTED/CONDEMNED — usable as a CI gate. `--mcp`/`report --mcp` lazy-import the
+  Glassport adapter so the protocol lib stays out of MO's core import graph.
+- Tests: `python3 -m pytest mo/`. The seam is mechanical — `mo/tests/test_seam.py`
+  asserts importing MO's core never loads `glassport` (keeps it protocol-agnostic).
+
 ## Verified Working
 
-`make` builds all three binaries; `make test` passes 7/7. `hello`, `echo_server`, `http_server`, `boot_splash` examples run; `raw_ping` needs `CAP_NET_RAW`/root.
+`make` builds all three binaries; `make test` passes 7/7. `hello`, `echo_server`, `http_server`, `boot_splash` examples run; `raw_ping` needs `CAP_NET_RAW`/root. MO: `python3 -m pytest mo/` passes 44/44.
 
 ## Note on AGENTS.md
 
