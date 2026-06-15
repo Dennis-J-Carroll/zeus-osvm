@@ -83,6 +83,26 @@ See `include/isa.h` for the full instruction set. Common opcodes:
 - Memory: `LOAD`, `STORE`, `LOADB`, `STOREB`, `LOADI`, `STOREI`, `LOADBI`, `STOREBI`
 - I/O: `PRINT`, `PRINTC`, `READ`
 
+## MO — the Mount Olympus spec runner
+
+`mo/` is a Python sibling package (it never imports the C VM). It judges an
+agent's behavior against a declared `.zspec`: tracks open obligations, fires
+verdicts — `FULFILLED`, `BOLTED` (a liveness window lapsed), `CONDEMNED` (a
+safety assertion broke). See [`MO_PLAN.md`](MO_PLAN.md) for the design.
+
+Four ways to run it:
+
+```bash
+python3 -m mo eval   spec.zspec trace.jsonl          # replay a recorded ZeusEvent stream
+python3 -m mo eval   --mcp spec.zspec session.jsonl  # replay a captured Glassport MCP tap log
+python3 -m mo watch  spec.zspec session.jsonl        # judge a growing tap log live (ticks expire silent windows)
+python3 -m mo report spec.zspec trace.jsonl -o out.html  # render a self-contained HTML timeline
+```
+
+Verdicts go to stdout as JSONL, a human summary to stderr; exit code is `1` if
+anything BOLTED or CONDEMNED, so `mo` works as a CI gate. Run the tests with
+`python3 -m pytest mo/`.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE). Have fun!
