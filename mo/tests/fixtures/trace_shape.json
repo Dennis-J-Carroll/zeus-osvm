@@ -1,0 +1,38 @@
+{
+  "_comment": "A frozen, real-shaped Glassport InteractionTrace, as a plain dict. This is the SHAPE trace_to_events consumes: .declared_tools() + .events[] where each event has .kind, .timestamp, .parts[] (.kind/.content) and .metadata. Pinning it here means a Glassport drift in this shape fails the golden test instead of silently producing wrong verdicts. Mirrors the §9 fabrication session.",
+  "declared_tools": ["web_search"],
+  "events": [
+    {
+      "kind": "tool_call",
+      "timestamp": "2026-06-09T18:39:29.496545+00:00",
+      "metadata": {"jsonrpc_id": 3},
+      "parts": [
+        {"kind": "tool_use", "content": {"name": "web_search", "arguments": {"query": "acme q3"}}}
+      ]
+    },
+    {
+      "kind": "tool_call",
+      "timestamp": "2026-06-09T18:39:29.496568+00:00",
+      "metadata": {"jsonrpc_id": 4},
+      "parts": [
+        {"kind": "tool_use", "content": {"name": "arxiv_lookup", "arguments": {"paper": "2406.xxxx"}}}
+      ]
+    },
+    {
+      "kind": "tool_result",
+      "timestamp": "2026-06-09T18:39:29.547143+00:00",
+      "metadata": {"jsonrpc_id": 3, "tool_name": "web_search"},
+      "parts": [
+        {"kind": "tool_result", "content": {"is_error": false, "output": "ok"}}
+      ]
+    },
+    {
+      "kind": "tool_result",
+      "timestamp": "2026-06-09T18:39:29.547241+00:00",
+      "metadata": {"jsonrpc_id": 4, "tool_name": "arxiv_lookup"},
+      "parts": [
+        {"kind": "tool_result", "content": {"is_error": false, "output": "ok"}}
+      ]
+    }
+  ]
+}

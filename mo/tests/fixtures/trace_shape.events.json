@@ -1,0 +1,49 @@
+[
+  {
+    "correlation": null,
+    "identifier": "web_search",
+    "payload": {},
+    "primitive": "tool_declared",
+    "ts": 1781030369496.5452
+  },
+  {
+    "correlation": "3",
+    "identifier": "web_search",
+    "payload": {
+      "arguments": {
+        "query": "acme q3"
+      }
+    },
+    "primitive": "tool_called",
+    "ts": 1781030369496.5452
+  },
+  {
+    "correlation": "4",
+    "identifier": "arxiv_lookup",
+    "payload": {
+      "arguments": {
+        "paper": "2406.xxxx"
+      }
+    },
+    "primitive": "tool_called",
+    "ts": 1781030369496.5679
+  },
+  {
+    "correlation": "3",
+    "identifier": "web_search",
+    "payload": {
+      "is_error": false
+    },
+    "primitive": "tool_result",
+    "ts": 1781030369547.143
+  },
+  {
+    "correlation": "4",
+    "identifier": "arxiv_lookup",
+    "payload": {
+      "is_error": false
+    },
+    "primitive": "tool_result",
+    "ts": 1781030369547.241
+  }
+]
