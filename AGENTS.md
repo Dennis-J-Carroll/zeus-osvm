@@ -88,7 +88,7 @@ python3 -m mo report spec.zspec trace.jsonl -o out.html  # self-contained HTML t
 
 ## Verified Working
 
-`make` builds all three binaries; `make test` passes 7/7. `make smoke` passes 8/8. `hello`, `echo_server`, `http_server`, `boot_splash` examples run; `raw_ping` needs `CAP_NET_RAW`/root. MO: `python3 -m pytest mo/` passes 53/53.
+`make` builds all three binaries; `make test` passes 7/7. `make smoke` passes 8/8. `hello`, `echo_server`, `http_server`, `boot_splash` examples run; `raw_ping` needs `CAP_NET_RAW`/root. MO: `python3 -m pytest mo/` passes 60/60 (the live dogfood is marked `slow`; `-m "not slow"` runs 59). Golden adapter contract (`mo/tests/fixtures/`) and one-command live dogfood (`python3 -m mo.examples.live_dogfood`) both green.
 
 Recent additions:
 - Correlation ids: `ZeusEvent` and `Obligation` carry a `correlation` field so
