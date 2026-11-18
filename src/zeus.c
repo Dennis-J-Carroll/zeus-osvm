@@ -21,6 +21,9 @@ const char *zeus_error_string(ZeusError err) {
         case ZEUS_ERR_PACKET:          return "packet error";
         case ZEUS_ERR_IO:              return "i/o error";
         case ZEUS_ERR_HALT:            return "halted";
+        case ZEUS_ERR_BAD_BYTECODE:    return "invalid bytecode (reassemble from .zasm)";
+        case ZEUS_ERR_EFFECT:          return "effect error";
+        case ZEUS_ERR_SNAPSHOT:        return "invalid or corrupt snapshot";
         default:                       return "unknown error";
     }
 }

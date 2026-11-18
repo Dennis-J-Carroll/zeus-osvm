@@ -1,11 +1,17 @@
-"""The verdict engine. No cursor: each event expires, satisfies, condemns,
-and triggers against the ledger. Deterministic on replay because time only
-advances via event timestamps (premortem #6 — never read wall clock here).
+"""The verdict engine.
+
+A `Judge` holds the obligation ledger and evaluates one event at a time with
+`observe()`. `observe()` never finalises: it does not emit end-of-stream BOLTs
+and it does not touch the wall clock. `finish()` is the only finaliser.
+
+That split is what makes a *pre-delivery* gate possible: a caller can judge an
+intended effect on a forked judge, decide, and commit the state only if the
+effect is actually allowed to happen. See `mo/gate.py`.
 """
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 from .ledger import Obligation, ObligationLedger
 from .rules import Spec
@@ -26,6 +32,12 @@ class RunResult:
     verdicts: list[Verdict] = field(default_factory=list)
     total_events: int = 0
     unmatched_events: int = 0    # coverage signal (premortem #5)
+
+
+@dataclass
+class Observation:
+    verdicts: list[Verdict] = field(default_factory=list)
+    matched: bool = False        # did any rule claim this event?
 
 
 def _bolt(ob: Obligation, closed_at: float, reason: str) -> Verdict:
@@ -67,48 +79,61 @@ def _condemn(ev, rule) -> Verdict:
     )
 
 
-def iter_verdicts(stream, spec: Spec, stats: RunResult | None = None):
-    """The judge as a generator: yield each Verdict the moment it is decided.
+class Judge:
+    """Stateful evaluator. Deterministic: time only advances via event ts."""
 
-    This is the one evaluation loop. `run()` drains it into a RunResult for
-    batch/replay; `mo watch` consumes it lazily so a live session prints a BOLT
-    the instant a window lapses rather than at session end. Coverage counters
-    can't ride along in the verdict yield, so a caller wanting them passes a
-    RunResult as `stats` and the loop updates it in place.
-    """
-    ledger = ObligationLedger()
-    seen: dict = defaultdict(set)   # primitive -> set of identifiers observed
-    last_ts = 0.0
+    def __init__(self, spec: Spec) -> None:
+        self.spec = spec
+        self.ledger = ObligationLedger()
+        self.seen: dict = defaultdict(set)
+        self.last_ts = 0.0
+        self.total_events = 0
+        self.unmatched_events = 0
 
-    for ev in stream:
-        last_ts = ev.ts
+    def fork(self) -> "Judge":
+        """An independent copy of the current state.
+
+        Used to judge an intended effect without committing it: if the effect
+        is denied, the original judge never learns that it happened.
+        """
+        clone = Judge(self.spec)
+        clone.ledger._obligations = [
+            Obligation(**{f.name: getattr(ob, f.name) for f in fields(ob)})
+            for ob in self.ledger._obligations
+        ]
+        clone.seen = defaultdict(set, {k: set(v) for k, v in self.seen.items()})
+        clone.last_ts = self.last_ts
+        clone.total_events = self.total_events
+        clone.unmatched_events = self.unmatched_events
+        return clone
+
+    def observe(self, ev) -> Observation:
+        """Judge one event. No end-of-stream BOLT, no wall clock."""
+        verdicts: list[Verdict] = []
+        self.last_ts = ev.ts
 
         # a tick is a pure time carrier (premortem #1, the silence problem):
-        # it only advances the clock so open windows can expire during silence.
-        # It is NOT a wire event — it never fulfills, condemns, or triggers, and
-        # it stays out of the coverage denominator (premortem #5) so a quiet
-        # live session does not read as "all blind". The wall clock that mints
-        # ticks lives in the adapter; the engine still only reads ev.ts (#6).
+        # it advances the clock and expires windows, but never fulfills,
+        # condemns, triggers, or counts toward coverage (premortem #5).
         if ev.primitive == "tick":
-            for ob in ledger.open_obligations():
+            for ob in self.ledger.open_obligations():
                 if ev.ts > ob.expires_at:
-                    ledger.close(ob, "bolted")
-                    yield _bolt(ob, ev.ts, "liveness_window_expired")
-            continue
+                    self.ledger.close(ob, "bolted")
+                    verdicts.append(_bolt(ob, ev.ts, "liveness_window_expired"))
+            return Observation(verdicts, True)
 
-        if stats is not None:
-            stats.total_events += 1
-        seen[ev.primitive].add(ev.identifier)
+        self.total_events += 1
+        self.seen[ev.primitive].add(ev.identifier)
         matched = False
 
         # a) expire first, against THIS event's timestamp (deterministic)
-        for ob in ledger.open_obligations():
+        for ob in self.ledger.open_obligations():
             if ev.ts > ob.expires_at:
-                ledger.close(ob, "bolted")
-                yield _bolt(ob, ev.ts, "liveness_window_expired")
+                self.ledger.close(ob, "bolted")
+                verdicts.append(_bolt(ob, ev.ts, "liveness_window_expired"))
 
         # b) satisfy any open obligation this event closes
-        for ob in ledger.open_obligations():
+        for ob in self.ledger.open_obligations():
             if ev.primitive == ob.expects and ev.identifier == ob.identifier:
                 # correlation-aware matching (premortem #2): if either side has
                 # an instance id, they must agree exactly. When neither has one,
@@ -116,30 +141,58 @@ def iter_verdicts(stream, spec: Spec, stats: RunResult | None = None):
                 if (ob.correlation is not None or ev.correlation is not None) \
                         and ev.correlation != ob.correlation:
                     continue
-                ledger.close(ob, "fulfilled")
-                yield _fulfill(ob, ev.ts)
+                self.ledger.close(ob, "fulfilled")
+                verdicts.append(_fulfill(ob, ev.ts))
                 matched = True
                 break
 
         # c) safety: does this event violate an ASSERT?
-        for rule in spec.assertions:
-            if rule.violated_by(ev, seen):
-                yield _condemn(ev, rule)
+        for rule in self.spec.assertions:
+            if rule.violated_by(ev, self.seen):
+                verdicts.append(_condemn(ev, rule))
                 matched = True
 
         # d) does this event TRIGGER new obligations?
-        for rule in spec.triggers:
+        for rule in self.spec.triggers:
             if rule.fires_on(ev):
-                ledger.open(rule.make_obligation(ev))
+                self.ledger.open(rule.make_obligation(ev))
                 matched = True
 
-        if not matched and stats is not None:
-            stats.unmatched_events += 1
+        if not matched:
+            self.unmatched_events += 1
 
-    # e) end of stream: every still-open obligation is a BOLT
-    for ob in ledger.open_obligations():
-        ledger.close(ob, "bolted")
-        yield _bolt(ob, last_ts, "session_ended_unresolved")
+        return Observation(verdicts, matched)
+
+    def finish(self) -> list[Verdict]:
+        """End of stream: every still-open obligation is a BOLT."""
+        verdicts: list[Verdict] = []
+        for ob in self.ledger.open_obligations():
+            self.ledger.close(ob, "bolted")
+            verdicts.append(_bolt(ob, self.last_ts, "session_ended_unresolved"))
+        return verdicts
+
+
+def iter_verdicts(stream, spec: Spec, stats: RunResult | None = None):
+    """The judge as a generator: yield each Verdict the moment it is decided.
+
+    `run()` drains it into a RunResult for batch/replay; `mo watch` consumes it
+    lazily so a BOLT prints the instant a window lapses rather than at session
+    end. Coverage counters can't ride along in the verdict yield, so a caller
+    wanting them passes a RunResult as `stats` and the loop fills it in at the
+    end.
+    """
+    judge = Judge(spec)
+
+    for ev in stream:
+        for v in judge.observe(ev).verdicts:
+            yield v
+
+    for v in judge.finish():
+        yield v
+
+    if stats is not None:
+        stats.total_events = judge.total_events
+        stats.unmatched_events = judge.unmatched_events
 
 
 def run(stream, spec: Spec) -> RunResult:

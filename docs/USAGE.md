@@ -42,7 +42,8 @@ From the repo root (`/home/dennisjcarroll/Desktop/cc_zone/zeus`):
 
 ```bash
 make            # builds zeus, zasm, zdis
-make test       # runs unit tests (expect 7/7)
+make test       # unit tests (4/4 + 3/3 + 12/12 + 6/6)
+make check      # same suite under ASan + UBSan, then a normal rebuild
 make smoke      # full end-to-end check against every example
 make clean      # remove binaries, *.o, examples/*.zeus, zasm/zdis wrappers
 ```
@@ -69,14 +70,169 @@ Three artifacts are produced:
 `zeus` dispatches on its first argument (`src/main.c`):
 
 ```bash
-zeus run     <file.zeus>              # execute a bytecode file
-zeus asm     <in.zasm> <out.zeus>     # assemble source -> bytecode
-zeus dis     <file.zeus>              # disassemble bytecode -> instructions
-zeus run-asm <in.zasm>                # assemble in memory and run immediately
+zeus run     <file.zeus> [options]     # execute a bytecode file
+zeus restore <file.zsnap> [options]    # resume a suspended machine
+zeus save    <in.zeus> <out.zsnap>     # snapshot a machine
+zeus asm     <in.zasm> <out.zeus>      # assemble source -> bytecode
+zeus dis     <file.zeus>               # disassemble bytecode -> instructions
+zeus run-asm <in.zasm> [options]       # assemble in memory and run immediately
+zeus approve <dossier> [--out F]       # approve the exact pending effect
+zeus deny    <dossier> [--journal F]   # kill a machine at its pending effect
+zeus jail    [--check] -- <cmd> [args] # namespaces + uid drop + seccomp
 ```
 
 `zasm in.zasm out.zeus` == `zeus asm in.zasm out.zeus`, and `zdis file.zeus` ==
 `zeus dis file.zeus`.
+
+Options for `run`, `restore` and `run-asm`:
+
+| Option          | Meaning                                                          |
+|-----------------|------------------------------------------------------------------|
+| `--max-steps N` | Execute at most N instructions, then stop with the machine live   |
+| `--journal F`   | Append-only JSONL audit log (intent before effect, commit after)  |
+| `--save F`      | Write a snapshot to F when it stops; with `--ask`, the parking file|
+| `--ask`         | Park before sensitive effects and write a dossier                 |
+| `--approve F`   | Approval file checked against the pending effect; implies `--ask`  |
+| `--allow-raw`   | Allow `RAW_*` effects (default: denied)                           |
+| `--lineage ID`  | Continue an existing audit lineage                                |
+
+### 3.1 Suspend and resume
+
+Every observable operation is an **effect**: a recorded request that the
+interpreter yields instead of performing. A stopped machine is therefore just
+its state plus at most one pending effect, and both serialize cleanly.
+
+```bash
+# Run three instructions, write the machine to disk, journal its effects.
+./zeus run-asm prog.zasm --max-steps 3 --save m.zsnap --journal effects.jsonl
+
+# Later, anywhere: pick the machine up exactly where it stopped.
+./zeus restore m.zsnap
+```
+
+`zeus save` is the same operation with a default budget of zero instructions,
+so it snapshots a freshly loaded image:
+
+```bash
+./zasm prog.zasm prog.zeus
+./zeus save prog.zeus cold.zsnap          # suspended at entry, ready to resume
+./zeus restore cold.zsnap --max-steps 10  # run ten instructions
+```
+
+Restoring the same snapshot twice yields two independent machines that can be
+stepped differently — that is the fork primitive. Snapshots are versioned and
+checksummed, so a truncated or edited file is rejected instead of resumed.
+
+`zeus_vm_restore` requires a `zeus_vm_init`-ed machine and is atomic: the file
+is validated into a temporary machine first, so a failed restore leaves the
+destination exactly as it was. The writer is equally strict — it refuses to
+serialize a machine whose pc/sp/csp, lifecycle flags, pending effect or packet
+slots are inconsistent, so every `.zsnap` is a state execution could produce.
+
+### 3.2 Policy: the seam decides, not the machine
+
+Every effect is checked against a `ZeusPolicy` held by the supervising process
+before it reaches the host. `run`, `restore` and `run-asm` use the `STANDARD`
+profile:
+
+| Effect family | Default |
+|---|---|
+| `PRINT`, `PRINTC`, `READ` | allowed |
+| socket effects | allowed |
+| `RAW_*` packet effects | **denied** |
+
+Raw sockets need an explicit `--allow-raw` (the `FULL` profile). A denied
+effect is never converted into a result the program can ignore: the machine is
+halted with `ZEUS_ERR_EFFECT`, the denial is journaled, and `zeus` exits 4.
+Policy lives in the process, not in the snapshot — restoring a file cannot
+loosen it.
+
+### 3.3 The audit journal
+
+`--journal F` writes JSONL and opens `F` for **append**; an existing journal is
+never truncated. Every delivered effect produces an `intent` record, flushed
+and fsynced before the effect reaches the host, then a `commit`:
+
+```json
+{"seq":1,"event":"intent","machine":"…","lineage":"…","effect":"send","fd":3,"buf":1024,"len":16,"digest":"0x…"}
+{"seq":1,"event":"commit","machine":"…","lineage":"…","result":16,"error":0}
+```
+
+`seq` and `lineage` belong to the supervisor. A restored machine resumes
+counting from the journal, so a snapshot cannot rewind the counter and two
+machines cannot reuse a sequence number. If a process dies between `intent` and
+`commit`, the next run on that lineage refuses to start: the effect may already
+have happened, and replaying it silently is exactly what the record exists to
+prevent.
+
+### 3.4 Approval: park, approve, resume, deny
+
+`--ask` parks the machine at the first non-sink effect. It writes the snapshot
+(with the effect still pending) plus `<snapshot>.dossier`, then exits 3:
+
+```bash
+./zeus run-asm prog.zasm --ask --save m.zsnap --journal audit.jsonl   # exit 3
+./zeus approve m.zsnap.dossier --out m.approve                        # exit 0
+./zeus restore m.zsnap --ask --approve m.approve --journal audit.jsonl # exit 0
+./zeus deny m.zsnap.dossier --journal audit.jsonl                     # exit 4
+```
+
+The dossier names the effect, its sequence number and a digest of the resolved
+operands (including buffer contents). The approval stores exactly
+`(lineage, seq, digest)` and is checked against the machine in hand, never
+against the file name: editing the snapshot changes the digest, so the approval
+stops matching and the run is refused with exit 4. One approval authorises one
+effect, and `--approve` implies the gate even if `--ask` is omitted: the
+approval covers the first sensitive effect and the ones after it park for their
+own.
+
+A restore that is not given `--save` parks back into the file it was restored
+from, so a program with several sensitive effects can be resumed one approval
+at a time:
+
+```bash
+./zeus run-asm two.zasm --ask --save m.zsnap --journal audit.jsonl    # park seq 1
+./zeus approve m.zsnap.dossier --out m.zsnap.dossier.seq1.approve
+./zeus restore m.zsnap --approve m.zsnap.dossier.seq1.approve --journal audit.jsonl
+                                                                     # park seq 2
+```
+
+Each park prints an approval path qualified by its sequence number, because an
+existing approval is refused rather than overwritten. A spent approval cannot
+authorise the next effect: the sequence number it names has moved on, and the
+refusal spends the number of the effect it declined, so the journal never
+records two different outcomes for one `seq`.
+
+The digest is a binding checksum, not a signature. An approval is only as
+trustworthy as the directory it lives in: keep it somewhere the untrusted
+machine cannot write, and rely on the jail for the layer that does not depend
+on the VM's cooperation.
+
+`zeus deny` takes the dossier too, so the refusal is recorded in the same
+lineage and checked against the same digest as the approval would have been,
+and kills the machine at the seam rather than resuming it with `-1`: handing a
+refusal to the program as an ordinary result would let it continue past a
+capability it was not granted.
+
+### 3.5 The jail
+
+`zeus jail` is the layer that does not depend on the VM's cooperation:
+
+```bash
+./zeus jail --check                  # probe each layer separately
+./zeus jail -- ./zeus run untrusted.zeus
+```
+
+It enters a fresh network namespace, drops to `nobody` when started as root,
+and installs a seccomp filter that refuses `socket(AF_PACKET, …)` and
+`socket(…, SOCK_RAW, …)` with `EPERM`. Ordinary TCP/UDP sockets still work; the
+network namespace is what limits where they can reach. Every layer fails
+closed. Because raw delivery is impossible inside the jail, a raw-capable run
+is necessarily a separate, unsandboxed `--allow-raw` invocation: the privileged
+capability never shares a process with untrusted bytecode.
+
+Hosts that disable unprivileged user namespaces refuse the namespace layer
+(`--check` reports it); the seccomp layer can still pass independently.
 
 ### Typical loops
 
@@ -479,21 +635,50 @@ design. Check results on the stack rather than assuming success.
 
 ## 10. Bytecode file format
 
-A `.zeus` file is a 17-byte header followed by the code bytes, then the data
-bytes (`include/bytecode.h`):
+A `.zeus` file is a **17-byte packed header** followed by the code bytes, then
+the data bytes (`include/bytecode.h`, `src/bytecode.c`):
 
 | Field         | Size | Notes                                  |
 |---------------|------|----------------------------------------|
 | `magic`       | 4    | ASCII `"ZEUS"`                          |
-| `version`     | 1    | currently `1` (`ZEUS_VERSION`)          |
+| `version`     | 1    | currently `2` (`ZEUS_VERSION`)          |
 | `entry_point` | 4    | start offset into code (assembler: `0`) |
 | `code_len`    | 4    | length of code section                  |
 | `data_len`    | 4    | length of data section                  |
 | code…         | var  | instruction bytes                       |
 | data…         | var  | data bytes (copied to memory addr 0)    |
 
-The loader rejects a file whose magic or version doesn't match. **If you ever
-change the on-disk layout, bump `ZEUS_VERSION` in `include/zeus.h`.**
+The header is written and read field by field, little-endian, at exactly 17
+bytes — no compiler padding reaches the file. The loader rejects a file whose
+magic, version, declared lengths or total size disagree, and it never truncates
+a data section: a `.data` section above 65,536 bytes is an assembly error.
+
+**If you ever change the on-disk layout, bump `ZEUS_VERSION` in
+`include/zeus.h`.** Version 2 replaced the old padded 20-byte struct header, so
+version 1 files must be reassembled from `.zasm`.
+
+### 10.1 Snapshot format
+
+`zeus save` / `zeus restore` use a separate `.zsnap` container
+(`include/snapshot.h`, `src/snapshot.c`). It embeds the program, `pc`, `sp`,
+`csp`, the error code, lifecycle flags, both stacks, all 65,536 memory bytes,
+raw-packet slots (with their ids) and the pending effect. A FNV-1a 64 checksum
+over the whole payload is stored last.
+
+Format 2 has a 14-field u32 header. `yielded` is the single "a pending effect
+exists" bit, and each packet entry carries its slot index, so a fork keeps
+raw-packet ids stable even when a lower slot was freed.
+
+The reader validates the checksum, both version numbers, and every invariant
+execution relies on: `running` implies `started` and `error == ZEUS_OK`;
+`yielded` implies `running` and a non-NONE effect; a non-yielded machine has a
+zeroed pending effect; pending buffers and strings lie inside memory; packet
+slots are well formed. Restore is atomic — on failure the destination machine
+is untouched, on success it is replaced wholesale. A lifecycle state is
+preserved exactly: a halted machine stays halted, and a suspended one yields
+the same pending effect on the next step. A typical machine snapshot is about
+132 KiB; a snapshot taken by a different build is refused with "invalid or
+corrupt snapshot".
 
 ---
 
@@ -501,7 +686,8 @@ change the on-disk layout, bump `ZEUS_VERSION` in `include/zeus.h`.**
 
 The VM stops with one of these (`include/zeus.h`): stack under/overflow, call
 stack under/overflow, out-of-bounds (bad code or memory address), divide by
-zero, invalid opcode, the `NET_*` family, packet errors, and I/O errors.
+zero, invalid opcode, the `NET_*` family, packet errors, I/O errors, invalid
+bytecode, effect errors, and invalid or corrupt snapshots.
 
 Debugging workflow:
 
@@ -525,7 +711,7 @@ Debugging workflow:
 
 ## 12. Gotchas
 
-- **Jumps are absolute**, not relative — despite the `isa.h` comment on `JMP`.
+- **Jumps are absolute** code offsets, not relative.
 - **Two address spaces.** Code offsets (for `JMP`/`CALL`) and memory addresses
   (for `LOAD`/`STORE`/net) both start at 0 and are unrelated.
 - **No print-string opcode** — loop over bytes until the `\0` (use `.asciz`).
@@ -533,6 +719,9 @@ Debugging workflow:
 - **String literals max 8192 bytes** (`src/asm.c`).
 - **Networking is single-threaded and blocking** — a server blocks in `ACCEPT`;
   run it with `&` and `kill` it, or use two terminals. No `select`/`poll` yet.
+- **Arithmetic is total, not trapping.** `ADD`/`SUB`/`MUL`/`NEG` wrap at 64
+  bits, shift counts are masked to 0–63, and `INT64_MIN / -1` wraps. This is
+  deliberate: defined results are what make replay and snapshots reproducible.
 - **Raw packets need `CAP_NET_RAW`/root**; otherwise they degrade to `-1`.
 - **`make clean` deletes `examples/*.zeus`** and the `zasm`/`zdis` wrappers —
   rerun `make` to get them back.

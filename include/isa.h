@@ -52,7 +52,7 @@ typedef enum {
     OP_GE = 0x35,
 
     /* Control flow */
-    OP_JMP  = 0x40,  /* JMP offset: unconditional relative jump */
+    OP_JMP  = 0x40,  /* JMP addr: unconditional absolute jump (code offset) */
     OP_JZ   = 0x41,  /* JZ offset: jump if top of stack is zero */
     OP_JNZ  = 0x42,  /* JNZ offset: jump if top of stack is non-zero */
     OP_CALL = 0x43,  /* CALL addr: push return address, jump to addr */

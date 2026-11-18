@@ -118,13 +118,13 @@ if [ "${SKIP_RAW:-0}" = "1" ]; then
     skip "SKIP_RAW=1"
 elif [ "$(id -u)" -ne 0 ]; then
     # Unprivileged: opcodes should degrade to -1 without crashing.
-    if ./zeus run-asm examples/raw_ping.zasm >/tmp/zeus_raw.log 2>&1; then
+    if ./zeus run-asm examples/raw_ping.zasm --allow-raw >/tmp/zeus_raw.log 2>&1; then
         pass "raw ping degrades gracefully unprivileged (run as root to send real packets)"
     else
         fail "raw ping crashed unprivileged (should return -1, not crash)"
     fi
 else
-    if ./zeus run-asm examples/raw_ping.zasm >/tmp/zeus_raw.log 2>&1; then
+    if ./zeus run-asm examples/raw_ping.zasm --allow-raw >/tmp/zeus_raw.log 2>&1; then
         pass "raw ping sent (root)"
     else
         fail "raw ping (root, see /tmp/zeus_raw.log)"

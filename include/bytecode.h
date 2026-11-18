@@ -10,7 +10,19 @@
 extern "C" {
 #endif
 
-/* On-disk bytecode header (17 bytes) */
+/* On-disk bytecode header: exactly 17 bytes, little-endian, packed.
+ *
+ *   0..3   magic "ZEUS"
+ *   4      version
+ *   5..8   entry_point  (u32)
+ *   9..12  code_len     (u32)
+ *   13..16 data_len     (u32)
+ *
+ * The in-memory struct below has padding; it is NEVER written to disk.
+ * Serialization goes through explicit byte writers in src/bytecode.c so the
+ * file layout cannot drift with the compiler's ABI. */
+#define ZEUS_HEADER_SIZE 17u
+
 typedef struct {
     uint8_t magic[ZEUS_MAGIC_LEN];
     uint8_t version;

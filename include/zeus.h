@@ -11,7 +11,7 @@ extern "C" {
 
 /* Zeus_osVM common definitions */
 #define ZEUS_NAME     "Zeus_osVM"
-#define ZEUS_VERSION  1
+#define ZEUS_VERSION  2
 
 /* Magic bytes for Zeus bytecode files */
 #define ZEUS_MAGIC    "ZEUS"
@@ -23,6 +23,10 @@ extern "C" {
 #define ZEUS_MEMORY_SIZE  65536
 #define ZEUS_MAX_PACKETS  16
 #define ZEUS_MAX_PACKET_SIZE 65535
+
+/* Upper bound on a code section. Keeps a corrupt header from asking for
+ * an absurd allocation. */
+#define ZEUS_MAX_CODE_SIZE (16u * 1024u * 1024u)
 
 /* Error codes returned by VM operations */
 typedef enum {
@@ -45,7 +49,10 @@ typedef enum {
     ZEUS_ERR_PACKET,
     ZEUS_ERR_IO,
     ZEUS_ERR_HALT,
-    ZEUS_ERR_UNKNOWN
+    ZEUS_ERR_UNKNOWN,
+    ZEUS_ERR_BAD_BYTECODE,
+    ZEUS_ERR_EFFECT,
+    ZEUS_ERR_SNAPSHOT
 } ZeusError;
 
 const char *zeus_error_string(ZeusError err);
