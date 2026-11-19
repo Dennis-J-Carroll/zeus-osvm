@@ -163,7 +163,8 @@ counting from the journal, so a snapshot cannot rewind the counter and two
 machines cannot reuse a sequence number. If a process dies between `intent` and
 `commit`, the next run on that lineage refuses to start: the effect may already
 have happened, and replaying it silently is exactly what the record exists to
-prevent.
+prevent. A refused open writes nothing, so the unmatched intent stays the last
+record and every retry keeps refusing instead of erasing the evidence.
 
 ### 3.4 Approval: park, approve, resume, deny
 
@@ -181,8 +182,10 @@ The dossier names the effect, its sequence number and a digest of the resolved
 operands (including buffer contents). The approval stores exactly
 `(lineage, seq, digest)` and is checked against the machine in hand, never
 against the file name: editing the snapshot changes the digest, so the approval
-stops matching and the run is refused with exit 4. One approval authorises one
-effect, and `--approve` implies the gate even if `--ask` is omitted: the
+stops matching and the run is refused with exit 4. `zeus approve` applies the
+same check before it writes: it restores the snapshot named in the dossier and
+refuses to approve it (exit 4) if the pending effect's digest is different.
+One approval authorises one effect, and `--approve` implies the gate even if `--ask` is omitted: the
 approval covers the first sensitive effect and the ones after it park for their
 own.
 

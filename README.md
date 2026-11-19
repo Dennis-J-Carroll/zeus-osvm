@@ -72,10 +72,12 @@ natural policy point:
   handing the program a failure result it can ignore.
 - **Append-only audit** — `--journal F` writes `intent` before each effect and
   `commit` after, with a supervisor-owned sequence number and a digest of the
-  resolved operands. A crash between the two is refused on the next run.
+  resolved operands. A crash between the two is refused on every retry: a
+  refused open writes nothing, so the unmatched intent is never erased.
 - **Approval gate** — `--ask` (or `--approve`) parks the machine with the
-  effect pending and writes a dossier; `zeus approve` binds
-  `(lineage, seq, digest)` to the exact machine, and `zeus deny` kills it. A
+  effect pending and writes a dossier; `zeus approve` checks the digest against
+  the snapshot the dossier names, binds `(lineage, seq, digest)` to that exact
+  machine, and `zeus deny` kills it. A
   machine with several sensitive effects parks once per effect. A malformed
   approval is an error, not a denial: the parked machine is left untouched.
 - **OS jail** — `zeus jail` adds a network namespace, a uid drop and a seccomp

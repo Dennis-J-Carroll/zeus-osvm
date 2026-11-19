@@ -18,6 +18,8 @@ JOURNAL=/tmp/zeus_ask_journal.log
 SNAP=/tmp/zeus_ask.zsnap
 DOSSIER="$SNAP.dossier"
 APPROVAL=/tmp/zeus_ask.approve
+BAD_DOSSIER=/tmp/zeus_ask_bad.dossier
+BAD_APPROVAL=/tmp/zeus_ask_bad.approve
 
 PROG2=/tmp/zeus_ask_two.zasm
 JOURNAL2=/tmp/zeus_ask_two.log
@@ -34,12 +36,14 @@ A3="$DOSSIER3.seq1.approve"
 BAD3=/tmp/zeus_ask_hostile.approve
 JOURNAL4=/tmp/zeus_ask_hostile_run.log
 SNAP4=/tmp/zeus_ask_hostile_run.zsnap
+JOURNAL5=/tmp/zeus_ask_ambiguous.log
 
 cleanup() {
-    rm -f "$PROG" "$JOURNAL" "$SNAP" "$DOSSIER" "$APPROVAL" \
+    rm -f           "$PROG" "$JOURNAL" "$SNAP" "$DOSSIER" "$APPROVAL" \
+          "$BAD_DOSSIER" "$BAD_APPROVAL" \
           "$PROG2" "$JOURNAL2" "$SNAP2" "$DOSSIER2" "$A1" "$A2" \
           "$PROG3" "$JOURNAL3" "$SNAP3" "$DOSSIER3" "$A3" "$BAD3" \
-          "$JOURNAL4" "$SNAP4"
+          "$JOURNAL4" "$SNAP4" "$JOURNAL5"
 }
 cleanup
 trap cleanup EXIT
@@ -71,6 +75,14 @@ check "snapshot + dossier written" 1 "$PASS"
 
 ./zeus approve "$DOSSIER" --out "$APPROVAL" >/dev/null 2>&1
 check "approve exits 0" 0 "$?"
+
+# The dossier must describe the snapshot it names: a digest that does not
+# match the pending effect is refused, and no approval file is written.
+sed 's/^digest=.*/digest=0x0000000000000000/' "$DOSSIER" > "$BAD_DOSSIER"
+./zeus approve "$BAD_DOSSIER" --out "$BAD_APPROVAL" >/dev/null 2>&1
+check "approve refuses a dossier that does not match its snapshot (4)" 4 "$?"
+[ -e "$BAD_APPROVAL" ] && WROTE=1 || WROTE=0
+check "approve writes nothing for a mismatched dossier" 0 "$WROTE"
 
 # Restoring without the approval parks again rather than guessing.
 ./zeus restore "$SNAP" --journal "$JOURNAL" --ask --save "$SNAP" >/dev/null 2>&1
@@ -163,6 +175,25 @@ check "hostile approval: run delivered nothing" 0 \
 # The machine survived all of that: the original approval still resumes it.
 ./zeus restore "$SNAP3" --journal "$JOURNAL3" --approve "$A3" >/dev/null 2>&1
 check "hostile approval: machine still resumes (0)" 0 "$?"
+
+# ------------------------------------------------------------------
+# An unmatched intent is evidence, not a state a retry may clear. A
+# refused open used to append a `start` record after the intent, so the
+# second retry looked clean and replayed an effect that may already have
+# happened. Both retries must refuse and write nothing.
+# ------------------------------------------------------------------
+LINEAGE3="$(sed -n 's/^lineage=//p' "$DOSSIER3")"
+{
+    printf '{"seq":0,"event":"start","machine":"deadbeef","lineage":"%s"}\n' "$LINEAGE3"
+    printf '{"seq":1,"event":"intent","machine":"deadbeef","lineage":"%s","effect":"read"}\n' "$LINEAGE3"
+} > "$JOURNAL5"
+
+./zeus restore "$SNAP3" --journal "$JOURNAL5" --lineage "$LINEAGE3" >/dev/null 2>&1
+check "unmatched intent: first retry refuses (1)" 1 "$?"
+./zeus restore "$SNAP3" --journal "$JOURNAL5" --lineage "$LINEAGE3" >/dev/null 2>&1
+check "unmatched intent: second retry refuses (1)" 1 "$?"
+check "unmatched intent: retries wrote no start record" 1 \
+    "$(grep -c '"event":"start"' "$JOURNAL5")"
 
 if [ "$FAIL" -eq 0 ]; then
     printf '  [ask] all checks passed\n'

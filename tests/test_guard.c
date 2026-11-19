@@ -457,6 +457,63 @@ static int test_uncommitted_intent_refuses(void) {
     return ok;
 }
 
+/* The refused open must not repair the journal: it used to append a `start`
+ * record after the unmatched intent, so the second attempt saw a clean
+ * lineage and replayed an effect that may already have happened. Two retries
+ * in a row must both refuse, and neither may write to the journal. */
+static int test_ambiguity_survives_retries(void) {
+    const char *j = "/tmp/zeus_guard_amb_retry.log";
+    remove(j);
+
+    ZeusSupervisor seed;
+    zeus_supervisor_init(&seed);
+    char lineage[ZEUS_ID_LEN];
+    snprintf(lineage, sizeof(lineage), "%s", seed.lineage_id);
+
+    char line[512];
+    snprintf(line, sizeof(line),
+             "{\"seq\":0,\"event\":\"start\",\"machine\":\"%s\",\"lineage\":\"%s\"}",
+             seed.machine_id, lineage);
+    int ok = append_line(j, line);
+    snprintf(line, sizeof(line),
+             "{\"seq\":1,\"event\":\"intent\",\"machine\":\"%s\","
+             "\"lineage\":\"%s\",\"effect\":\"send\"}", seed.machine_id, lineage);
+    ok = ok && append_line(j, line);
+
+    ZeusPolicy p;
+    zeus_policy_init(&p, ZEUS_PROFILE_STANDARD);
+
+    ZeusProgram prog;
+    ZeusVM vm;
+    if (!build(&prog, &vm, "PUSH 1\nPRINT\nHALT\n")) {
+        remove(j);
+        return 0;
+    }
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        ZeusSupervisor s;
+        ok = ok && zeus_supervisor_open(&s, &p, j, lineage);
+        ok = ok && s.ambiguous && (s.ambiguous_seq == 1);
+
+        char why[256];
+        ok = ok && (zeus_supervisor_drive(&s, &vm, -1, why, sizeof(why))
+                    == ZEUS_DRIVE_FAILED);
+        ok = ok && (strstr(why, "uncommitted") != NULL);
+        ok = ok && !vm.started && (vm.pc == 0);
+        zeus_supervisor_close(&s);
+    }
+
+    /* Exactly the seeded start record: neither retry wrote anything. */
+    char *txt = slurp(j);
+    ok = ok && txt && (count_substr(txt, "\"event\":\"start\"") == 1);
+    free(txt);
+
+    zeus_vm_free(&vm);
+    zeus_program_free(&prog);
+    remove(j);
+    return ok;
+}
+
 /* A dossier is a human decision document. Anything ambiguous in it (a
  * truncated value, a duplicate key, an oversized field) must fail the load,
  * not produce a plausible-looking approval. */
@@ -638,6 +695,7 @@ int main(void) {
     RUN_TEST(test_approval_binds_the_held_machine);
     RUN_TEST(test_denial_spends_its_sequence);
     RUN_TEST(test_uncommitted_intent_refuses);
+    RUN_TEST(test_ambiguity_survives_retries);
     RUN_TEST(test_dossier_rejects_hostile_input);
     RUN_TEST(test_approval_rejects_hostile_input);
 

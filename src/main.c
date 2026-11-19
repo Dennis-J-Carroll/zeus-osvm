@@ -333,6 +333,45 @@ static int cmd_approve(const char *dossier_path, const char *out_path) {
         return ZEUS_EXIT_ERROR;
     }
 
+    /* Approve the machine the dossier describes, not the text of the dossier:
+     * restore the snapshot it names and bind to that pending effect's digest.
+     * seq and lineage belong to the journal, so they are checked again when
+     * the approval is used. */
+    if (d.snapshot[0] == '\0') {
+        fprintf(stderr, "error: dossier does not name a snapshot\n");
+        return ZEUS_EXIT_ERROR;
+    }
+
+    ZeusVM vm;
+    zeus_vm_init(&vm);
+
+    ZeusError err = zeus_vm_restore(&vm, d.snapshot);
+    if (err != ZEUS_OK) {
+        fprintf(stderr, "error restoring '%s': %s\n", d.snapshot,
+                zeus_error_string(err));
+        zeus_vm_free(&vm);
+        return ZEUS_EXIT_ERROR;
+    }
+    if (!vm.yielded) {
+        fprintf(stderr,
+                "error: machine in '%s' has no pending effect to approve\n",
+                d.snapshot);
+        zeus_vm_free(&vm);
+        return ZEUS_EXIT_ERROR;
+    }
+
+    uint64_t digest = zeus_effect_digest(&vm, &vm.pending);
+    if (digest != d.digest) {
+        fprintf(stderr,
+                "error: dossier digest 0x%016llx does not match snapshot "
+                "'%s' (0x%016llx); refusing to approve a different machine\n",
+                (unsigned long long)d.digest, d.snapshot,
+                (unsigned long long)digest);
+        zeus_vm_free(&vm);
+        return ZEUS_EXIT_DENIED;
+    }
+    zeus_vm_free(&vm);
+
     char default_out[ZEUS_PATH_LEN];
     if (!out_path) {
         snprintf(default_out, sizeof(default_out), "%s.approve", dossier_path);

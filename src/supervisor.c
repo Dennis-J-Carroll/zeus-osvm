@@ -96,6 +96,10 @@ static size_t bounded_strlen(const uint8_t *p, size_t max) {
 
 static bool journal_write(ZeusSupervisor *s, const char *line) {
     if (!s->journal) return true;
+    /* Nothing may follow an unmatched intent: any later record would look
+     * like an outcome for the effect and let the next open replay it. An
+     * ambiguous journal stays ambiguous until an operator resolves it. */
+    if (s->ambiguous) return false;
     if (fputs(line, s->journal) == EOF) return false;
     if (fputc('\n', s->journal) == EOF) return false;
     if (fflush(s->journal) != 0) return false;
@@ -238,6 +242,10 @@ static void scan_journal(const char *path, const char *lineage,
         if (strstr(line, "\"event\":\"intent\"")) {
             open_intent = true;
             pending_seq = seq;
+        } else if (strstr(line, "\"event\":\"start\"")) {
+            /* A start record says a process opened the journal; it is not an
+             * outcome for the effect. Older builds appended one after an
+             * unmatched intent, which erased it, so look through them. */
         } else {
             open_intent = false;
         }
@@ -500,7 +508,10 @@ bool zeus_supervisor_open(ZeusSupervisor *s, const ZeusPolicy *policy,
     s->journal = fopen(journal_path, "a");
     if (!s->journal) return false;
 
-    if (!journal_start(s)) {
+    /* Never append a `start` behind an unmatched intent: that record would
+     * make the next retry look clean and replay an effect that may already
+     * have happened. Refusing without writing keeps the evidence. */
+    if (!s->ambiguous && !journal_start(s)) {
         fclose(s->journal);
         s->journal = NULL;
         return false;
