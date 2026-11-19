@@ -65,7 +65,9 @@ typedef struct {
     uint64_t ambiguous_seq;
     bool ask;                  /* park instead of delivering sensitive effects */
 
-    char approval_path[ZEUS_PATH_LEN];
+    bool have_approval;        /* an approval is bound to the next effect */
+    ZeusApproval approval;     /* parsed once; the file is never re-read */
+
     char snapshot_path[ZEUS_PATH_LEN];
     char dossier_path[ZEUS_PATH_LEN];
 } ZeusSupervisor;
@@ -81,8 +83,12 @@ bool zeus_supervisor_open(ZeusSupervisor *s, const ZeusPolicy *policy,
 void zeus_supervisor_close(ZeusSupervisor *s);
 
 /* Paths are copied; the dossier is always "<snapshot>.dossier". */
-void zeus_supervisor_set_paths(ZeusSupervisor *s, const char *approval_path,
-                               const char *snapshot_path);
+void zeus_supervisor_set_paths(ZeusSupervisor *s, const char *snapshot_path);
+
+/* Bind an already validated approval. It authorises one effect and is held in
+ * memory, so a file that is changed or truncated after validation cannot turn
+ * into a denial at the effect. Pass NULL to unbind. */
+void zeus_supervisor_bind_approval(ZeusSupervisor *s, const ZeusApproval *a);
 
 uint64_t zeus_supervisor_next_seq(const ZeusSupervisor *s);
 
@@ -115,9 +121,9 @@ bool zeus_dossier_load(const char *path, ZeusDossier *out);
 bool zeus_approval_write(const ZeusDossier *d, const char *path);
 bool zeus_approval_load(const char *path, ZeusApproval *out);
 
-/* True only if `path` approves exactly this pending effect of this machine. */
-bool zeus_approval_matches(const char *path, const ZeusSupervisor *s,
-                           const ZeusVM *vm, const ZeusEffect *eff);
+/* True only if `a` approves exactly this pending effect of this machine. */
+bool zeus_approval_binds(const ZeusApproval *a, const ZeusSupervisor *s,
+                         const ZeusVM *vm, const ZeusEffect *eff);
 
 #ifdef __cplusplus
 }

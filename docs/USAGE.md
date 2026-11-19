@@ -203,6 +203,12 @@ authorise the next effect: the sequence number it names has moved on, and the
 refusal spends the number of the effect it declined, so the journal never
 records two different outcomes for one `seq`.
 
+The dossier and approval files are parsed strictly: a truncated file, a
+duplicate key or a value that cannot fit its field is rejected as an error
+(exit 1). That is deliberately not a refusal. A refusal spends the pending
+sequence number and kills the machine; a malformed file leaves the parked
+machine untouched so the operator can write a correct one.
+
 The digest is a binding checksum, not a signature. An approval is only as
 trustworthy as the directory it lives in: keep it somewhere the untrusted
 machine cannot write, and rely on the jail for the layer that does not depend

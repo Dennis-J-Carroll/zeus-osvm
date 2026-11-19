@@ -26,9 +26,20 @@ DOSSIER2="$SNAP2.dossier"
 A1="$DOSSIER2.seq1.approve"
 A2="$DOSSIER2.seq2.approve"
 
+PROG3=/tmp/zeus_ask_hostile.zasm
+JOURNAL3=/tmp/zeus_ask_hostile.log
+SNAP3=/tmp/zeus_ask_hostile.zsnap
+DOSSIER3="$SNAP3.dossier"
+A3="$DOSSIER3.seq1.approve"
+BAD3=/tmp/zeus_ask_hostile.approve
+JOURNAL4=/tmp/zeus_ask_hostile_run.log
+SNAP4=/tmp/zeus_ask_hostile_run.zsnap
+
 cleanup() {
     rm -f "$PROG" "$JOURNAL" "$SNAP" "$DOSSIER" "$APPROVAL" \
-          "$PROG2" "$JOURNAL2" "$SNAP2" "$DOSSIER2" "$A1" "$A2"
+          "$PROG2" "$JOURNAL2" "$SNAP2" "$DOSSIER2" "$A1" "$A2" \
+          "$PROG3" "$JOURNAL3" "$SNAP3" "$DOSSIER3" "$A3" "$BAD3" \
+          "$JOURNAL4" "$SNAP4"
 }
 cleanup
 trap cleanup EXIT
@@ -105,6 +116,53 @@ check "two effects: second resume exits 0" 0 "$?"
 # approval must be checked, not treated as a standing grant.
 ./zeus restore "$SNAP2" --journal "$JOURNAL2" --approve "$A1" >/dev/null 2>&1
 check "two effects: spent approval refused (4)" 4 "$?"
+
+# ------------------------------------------------------------------
+# A malformed approval is an error (exit 1), not a refusal (exit 4).
+# It must not spend the parked sequence, kill the machine or reach the
+# journal, and the good approval must still resume afterwards.
+# ------------------------------------------------------------------
+
+cat > "$PROG3" <<'EOF'
+READ
+HALT
+EOF
+
+./zeus run-asm "$PROG3" --ask --journal "$JOURNAL3" --save "$SNAP3" >/dev/null 2>&1
+check "hostile approval: park exits 3" 3 "$?"
+
+./zeus approve "$DOSSIER3" --out "$A3" >/dev/null 2>&1
+check "hostile approval: good approval written" 0 "$?"
+
+# Duplicate key: the file names two sequence numbers at once.
+cat "$A3" > "$BAD3"
+printf 'seq=1\n' >> "$BAD3"
+./zeus restore "$SNAP3" --journal "$JOURNAL3" --approve "$BAD3" >/dev/null 2>&1
+check "hostile approval: duplicate key is an error (1)" 1 "$?"
+check "hostile approval: duplicate key journals no denial" 0 \
+    "$(cat "$JOURNAL3" 2>/dev/null | grep -c '"event":"deny"')"
+
+# Truncation: every field is present, the digest is cut and the final
+# newline is gone. This used to read as a plausible approval.
+printf 'format=1\nkind=approval\nlineage=%s\nseq=1\ndigest=0x0123' \
+    "$(sed -n 's/^lineage=//p' "$A3")" > "$BAD3"
+./zeus restore "$SNAP3" --journal "$JOURNAL3" --approve "$BAD3" >/dev/null 2>&1
+check "hostile approval: truncated file is an error (1)" 1 "$?"
+
+# Oversized value: no field is allowed to be a buffer's worth of hex.
+{ cat "$A3"; printf 'digest=0x'; printf '%*s' 2000 '' | tr ' ' 'a'; printf '\n'; } > "$BAD3"
+./zeus restore "$SNAP3" --journal "$JOURNAL3" --approve "$BAD3" >/dev/null 2>&1
+check "hostile approval: oversized value is an error (1)" 1 "$?"
+
+# run --approve must refuse before opening a journal or delivering anything.
+./zeus run-asm "$PROG3" --journal "$JOURNAL4" --save "$SNAP4" --approve "$BAD3" >/dev/null 2>&1
+check "hostile approval: run refuses (1)" 1 "$?"
+check "hostile approval: run delivered nothing" 0 \
+    "$(cat "$JOURNAL4" 2>/dev/null | grep -c '"event":"\(intent\|deny\)"')"
+
+# The machine survived all of that: the original approval still resumes it.
+./zeus restore "$SNAP3" --journal "$JOURNAL3" --approve "$A3" >/dev/null 2>&1
+check "hostile approval: machine still resumes (0)" 0 "$?"
 
 if [ "$FAIL" -eq 0 ]; then
     printf '  [ask] all checks passed\n'

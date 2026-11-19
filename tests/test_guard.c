@@ -9,6 +9,8 @@
 #include "policy.h"
 #include "supervisor.h"
 
+#define GUARD_LINEAGE "0123456789abcdef0123456789abcdef"
+
 static int tests_run = 0;
 static int tests_failed = 0;
 
@@ -61,6 +63,15 @@ static int append_line(const char *path, const char *line) {
     FILE *f = fopen(path, "a");
     if (!f) return 0;
     int ok = fprintf(f, "%s\n", line) > 0;
+    if (fclose(f) != 0) ok = 0;
+    return ok;
+}
+
+static int write_text(const char *path, const char *text) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    size_t len = strlen(text);
+    int ok = fwrite(text, 1, len, f) == len;
     if (fclose(f) != 0) ok = 0;
     return ok;
 }
@@ -265,7 +276,7 @@ static int test_approval_binds_the_held_machine(void) {
     ZeusSupervisor s;
     if (!zeus_supervisor_open(&s, &p, j, NULL)) return 0;
     s.ask = true;
-    zeus_supervisor_set_paths(&s, NULL, snap);
+    zeus_supervisor_set_paths(&s, snap);
 
     char why[256];
     int ok = (zeus_supervisor_drive(&s, &vm, -1, why, sizeof(why))
@@ -285,31 +296,37 @@ static int test_approval_binds_the_held_machine(void) {
 
     ZeusSupervisor s2;
     ok = ok && zeus_supervisor_open(&s2, &p, j, d.lineage);
-    ok = ok && zeus_approval_matches(appr, &s2, &vm, &vm.pending);
+
+    ZeusApproval a;
+    ok = ok && zeus_approval_load(appr, &a);
+    ok = ok && zeus_approval_binds(&a, &s2, &vm, &vm.pending);
 
     /* A different held machine must not match the same approval. */
     ZeusVM other;
     zeus_vm_init(&other);
     ok = ok && (zeus_vm_restore(&other, snap) == ZEUS_OK);
     other.pending.value = 66;
-    ok = ok && !zeus_approval_matches(appr, &s2, &other, &other.pending);
+    ok = ok && !zeus_approval_binds(&a, &s2, &other, &other.pending);
     zeus_vm_free(&other);
 
     /* Same lineage/seq with the wrong digest is not an approval. */
+    ZeusApproval wrong;
     FILE *f = fopen(bad, "w");
     ok = ok && f != NULL;
     if (f) {
         fprintf(f, "format=1\nkind=approval\nlineage=%s\nseq=1\n"
                    "digest=0x0000000000000000\n", d.lineage);
         fclose(f);
-        ok = ok && !zeus_approval_matches(bad, &s2, &vm, &vm.pending);
+        ok = ok && zeus_approval_load(bad, &wrong);
+        ok = ok && !zeus_approval_binds(&wrong, &s2, &vm, &vm.pending);
     }
 
     ZeusVM resumed;
     zeus_vm_init(&resumed);
     ok = ok && (zeus_vm_restore(&resumed, snap) == ZEUS_OK);
     s2.ask = true;
-    zeus_supervisor_set_paths(&s2, appr, snap);
+    zeus_supervisor_set_paths(&s2, snap);
+    zeus_supervisor_bind_approval(&s2, &a);
     ok = ok && (zeus_supervisor_drive(&s2, &resumed, -1, why, sizeof(why))
                 == ZEUS_DRIVE_HALTED);
     ok = ok && (resumed.error == ZEUS_OK) && !resumed.yielded;
@@ -345,7 +362,7 @@ static int test_denial_spends_its_sequence(void) {
     ZeusSupervisor s;
     if (!zeus_supervisor_open(&s, &p, j, NULL)) return 0;
     s.ask = true;
-    zeus_supervisor_set_paths(&s, NULL, snap);
+    zeus_supervisor_set_paths(&s, snap);
 
     char why[256];
     int ok = (zeus_supervisor_drive(&s, &vm, -1, why, sizeof(why))
@@ -440,6 +457,178 @@ static int test_uncommitted_intent_refuses(void) {
     return ok;
 }
 
+/* A dossier is a human decision document. Anything ambiguous in it (a
+ * truncated value, a duplicate key, an oversized field) must fail the load,
+ * not produce a plausible-looking approval. */
+static int test_dossier_rejects_hostile_input(void) {
+    const char *p = "/tmp/zeus_guard_hostile.dossier";
+    ZeusDossier d;
+
+    const char *good =
+        "format=1\n"
+        "kind=dossier\n"
+        "lineage=" GUARD_LINEAGE "\n"
+        "seq=7\n"
+        "effect=read\n"
+        "digest=0x0123456789abcdef\n"
+        "snapshot=/tmp/m.zsnap\n";
+
+    int ok = write_text(p, good);
+    ok = ok && zeus_dossier_load(p, &d);
+    ok = ok && (d.seq == 7) && (d.digest == UINT64_C(0x0123456789abcdef));
+    ok = ok && (strcmp(d.lineage, GUARD_LINEAGE) == 0);
+    ok = ok && (strcmp(d.snapshot, "/tmp/m.zsnap") == 0);
+
+    /* Truncated mid-value: no final newline, so the digest is incomplete. */
+    ok = ok && write_text(p,
+        "format=1\nkind=dossier\nlineage=" GUARD_LINEAGE
+        "\nseq=7\ndigest=0x0123456789abcd");
+    ok = ok && !zeus_dossier_load(p, &d);
+
+    /* Truncated at a line boundary: a required field is missing. */
+    ok = ok && write_text(p,
+        "format=1\nkind=dossier\nlineage=" GUARD_LINEAGE "\nseq=7\n");
+    ok = ok && !zeus_dossier_load(p, &d);
+
+    /* Duplicate keys are ambiguous even when the values agree. */
+    ok = ok && write_text(p,
+        "format=1\nkind=dossier\nlineage=" GUARD_LINEAGE
+        "\nseq=7\ndigest=0x1\nseq=7\n");
+    ok = ok && !zeus_dossier_load(p, &d);
+    ok = ok && write_text(p,
+        "format=1\nkind=dossier\nlineage=" GUARD_LINEAGE
+        "\nseq=7\ndigest=0x1\nseq=8\n");
+    ok = ok && !zeus_dossier_load(p, &d);
+
+    /* A value that fits the line buffer but not the field. */
+    ok = ok && write_text(p,
+        "format=1\nkind=dossier\nlineage=" GUARD_LINEAGE "\nseq=7\n");
+    FILE *f = fopen(p, "a");
+    ok = ok && f != NULL;
+    if (f) {
+        fputs("digest=", f);
+        for (int i = 0; i < ZEUS_PATH_LEN + 16; i++) fputc('a', f);
+        fputc('\n', f);
+        ok = ok && fclose(f) == 0;
+    }
+    ok = ok && !zeus_dossier_load(p, &d);
+
+    /* A line longer than the parser's buffer. */
+    ok = ok && write_text(p,
+        "format=1\nkind=dossier\nlineage=" GUARD_LINEAGE "\nseq=7\n");
+    f = fopen(p, "a");
+    ok = ok && f != NULL;
+    if (f) {
+        fputs("digest=", f);
+        for (int i = 0; i < 4096; i++) fputc('a', f);
+        fputc('\n', f);
+        ok = ok && fclose(f) == 0;
+    }
+    ok = ok && !zeus_dossier_load(p, &d);
+
+    /* Trailing junk after a number is not the number. */
+    ok = ok && write_text(p,
+        "format=1\nkind=dossier\nlineage=" GUARD_LINEAGE
+        "\nseq=7x\ndigest=0x1\n");
+    ok = ok && !zeus_dossier_load(p, &d);
+
+    /* Empty, wrong kind, short id, junk digest. */
+    ok = ok && write_text(p, "");
+    ok = ok && !zeus_dossier_load(p, &d);
+    ok = ok && write_text(p,
+        "format=1\nkind=approval\nlineage=" GUARD_LINEAGE
+        "\nseq=7\ndigest=0x1\n");
+    ok = ok && !zeus_dossier_load(p, &d);
+    ok = ok && write_text(p,
+        "format=1\nkind=dossier\nlineage=abc\nseq=7\ndigest=0x1\n");
+    ok = ok && !zeus_dossier_load(p, &d);
+    ok = ok && write_text(p,
+        "format=1\nkind=dossier\nlineage=" GUARD_LINEAGE
+        "\nseq=7\ndigest=0xzz\n");
+    ok = ok && !zeus_dossier_load(p, &d);
+
+    remove(p);
+    return ok;
+}
+
+/* An approval is the last file between a parked effect and the host. A
+ * hostile or damaged one must never load as a decision. */
+static int test_approval_rejects_hostile_input(void) {
+    const char *dossier = "/tmp/zeus_guard_hostile.dossier";
+    const char *appr = "/tmp/zeus_guard_hostile.approve";
+    const char *bad = "/tmp/zeus_guard_hostile_bad.approve";
+
+    ZeusDossier d;
+    int ok = write_text(dossier,
+        "format=1\nkind=dossier\nlineage=" GUARD_LINEAGE
+        "\nseq=7\ndigest=0x0123456789abcdef\nsnapshot=/tmp/m.zsnap\n");
+    ok = ok && zeus_dossier_load(dossier, &d);
+    ok = ok && zeus_approval_write(&d, appr);
+
+    /* The writer's own output round-trips. */
+    ZeusApproval a;
+    ok = ok && zeus_approval_load(appr, &a);
+    ok = ok && (a.seq == 7) && (a.digest == UINT64_C(0x0123456789abcdef));
+    ok = ok && (strcmp(a.lineage, GUARD_LINEAGE) == 0);
+
+    /* Truncated: every field is present but the file has no final newline.
+     * This used to load as a valid approval. */
+    ok = ok && write_text(bad,
+        "format=1\nkind=approval\nlineage=" GUARD_LINEAGE
+        "\nseq=7\ndigest=0x0123456789abcdef");
+    ok = ok && !zeus_approval_load(bad, &a);
+
+    /* Truncated mid-digest: "0x0123" is a valid number, not a valid file. */
+    ok = ok && write_text(bad,
+        "format=1\nkind=approval\nlineage=" GUARD_LINEAGE
+        "\nseq=7\ndigest=0x0123");
+    ok = ok && !zeus_approval_load(bad, &a);
+
+    /* Duplicate keys, agreeing or not, are ambiguous. */
+    ok = ok && write_text(bad,
+        "format=1\nkind=approval\nlineage=" GUARD_LINEAGE
+        "\nseq=7\ndigest=0x1\nseq=7\n");
+    ok = ok && !zeus_approval_load(bad, &a);
+    ok = ok && write_text(bad,
+        "format=1\nkind=approval\nlineage=" GUARD_LINEAGE
+        "\nseq=7\ndigest=0x1\ndigest=0x2\n");
+    ok = ok && !zeus_approval_load(bad, &a);
+
+    /* Oversized values are refused, not silently truncated into a decision. */
+    ok = ok && write_text(bad,
+        "format=1\nkind=approval\nlineage=" GUARD_LINEAGE "\nseq=7\n");
+    FILE *f = fopen(bad, "a");
+    ok = ok && f != NULL;
+    if (f) {
+        fputs("digest=", f);
+        for (int i = 0; i < ZEUS_PATH_LEN + 16; i++) fputc('a', f);
+        fputc('\n', f);
+        ok = ok && fclose(f) == 0;
+    }
+    ok = ok && !zeus_approval_load(bad, &a);
+
+    /* Trailing junk after a number used to parse as the number. */
+    ok = ok && write_text(bad,
+        "format=1\nkind=approval\nlineage=" GUARD_LINEAGE
+        "\nseq=7x\ndigest=0x1\n");
+    ok = ok && !zeus_approval_load(bad, &a);
+
+    /* Whitespace or a sign is not bare hex. */
+    ok = ok && write_text(bad,
+        "format=1\nkind=approval\nlineage=" GUARD_LINEAGE
+        "\nseq=7\ndigest= 0x1\n");
+    ok = ok && !zeus_approval_load(bad, &a);
+    ok = ok && write_text(bad,
+        "format=1\nkind=approval\nlineage=" GUARD_LINEAGE
+        "\nseq=7\ndigest=+1\n");
+    ok = ok && !zeus_approval_load(bad, &a);
+
+    remove(bad);
+    remove(appr);
+    remove(dossier);
+    return ok;
+}
+
 int main(void) {
     printf("Running protection tests...\n");
     RUN_TEST(test_policy_defaults_to_deny);
@@ -449,6 +638,8 @@ int main(void) {
     RUN_TEST(test_approval_binds_the_held_machine);
     RUN_TEST(test_denial_spends_its_sequence);
     RUN_TEST(test_uncommitted_intent_refuses);
+    RUN_TEST(test_dossier_rejects_hostile_input);
+    RUN_TEST(test_approval_rejects_hostile_input);
 
     printf("\n%d/%d tests passed\n", tests_run - tests_failed, tests_run);
     return tests_failed > 0 ? 1 : 0;

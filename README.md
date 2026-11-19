@@ -76,7 +76,8 @@ natural policy point:
 - **Approval gate** — `--ask` (or `--approve`) parks the machine with the
   effect pending and writes a dossier; `zeus approve` binds
   `(lineage, seq, digest)` to the exact machine, and `zeus deny` kills it. A
-  machine with several sensitive effects parks once per effect.
+  machine with several sensitive effects parks once per effect. A malformed
+  approval is an error, not a denial: the parked machine is left untouched.
 - **OS jail** — `zeus jail` adds a network namespace, a uid drop and a seccomp
   filter that refuses raw sockets.
 

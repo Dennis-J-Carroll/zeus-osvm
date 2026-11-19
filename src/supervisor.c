@@ -200,6 +200,14 @@ static bool parse_u64_span(const char *s, uint64_t *out, const char **endp) {
     return true;
 }
 
+/* The whole value must be digits: "7x" is a malformed field, not the
+ * number 7. */
+static bool parse_u64(const char *s, uint64_t *out) {
+    const char *end = NULL;
+    if (!parse_u64_span(s, out, &end)) return false;
+    return end != NULL && *end == '\0';
+}
+
 /* Read the last committed effect number for `lineage`, and whether the
  * journal ends in an intent that never got a commit. */
 static void scan_journal(const char *path, const char *lineage,
@@ -300,6 +308,10 @@ typedef struct {
     char val[ZEUS_PATH_LEN];
 } Pair;
 
+/* Parse a key=value file. This format is written by this program and read by
+ * a human decision, so it is parsed strictly: anything that could mean two
+ * things (a cut-off line, a duplicate key, a value that does not fit) is
+ * rejected instead of guessed at. */
 static bool load_pairs(const char *path, Pair *pairs, size_t max, size_t *count) {
     *count = 0;
     FILE *f = fopen(path, "r");
@@ -309,9 +321,14 @@ static bool load_pairs(const char *path, Pair *pairs, size_t max, size_t *count)
     size_t n = 0;
 
     while (fgets(line, sizeof(line), f)) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-        if (line[0] == '\0' || line[0] == '#') continue;
+        size_t len = strlen(line);
+        /* No newline means the file was cut off mid-value or the line is
+         * longer than any valid field. Accepting the prefix would turn a
+         * truncated digest into a different digest. */
+        if (len == 0 || line[len - 1] != '\n') { fclose(f); return false; }
+        line[--len] = '\0';
+
+        if (len == 0 || line[0] == '#') continue;
 
         char *eq = strchr(line, '=');
         if (!eq || eq == line) { fclose(f); return false; }
@@ -321,6 +338,15 @@ static bool load_pairs(const char *path, Pair *pairs, size_t max, size_t *count)
         if (klen >= sizeof(pairs[n].key)) { fclose(f); return false; }
         memcpy(pairs[n].key, line, klen);
         pairs[n].key[klen] = '\0';
+
+        /* Duplicate keys are ambiguous: another reader (or a human) can
+         * disagree with this one about which value counts. Reject. */
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(pairs[i].key, pairs[n].key) == 0) {
+                fclose(f);
+                return false;
+            }
+        }
 
         int written = snprintf(pairs[n].val, sizeof(pairs[n].val), "%s", eq + 1);
         if (written < 0 || (size_t)written >= sizeof(pairs[n].val)) {
@@ -352,10 +378,16 @@ static void copy_field(char *dst, size_t cap, const char *src) {
     dst[n] = '\0';
 }
 
+static bool is_hex_digit(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+}
+
 static bool parse_digest(const char *s, uint64_t *out) {
     if (!s || !*s) return false;
     if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
-    if (!*s) return false;
+    /* strtoull accepts a leading sign or whitespace; a digest is bare hex. */
+    if (!is_hex_digit(*s)) return false;
     errno = 0;
     char *end = NULL;
     unsigned long long v = strtoull(s, &end, 16);
@@ -382,14 +414,14 @@ bool zeus_dossier_load(const char *path, ZeusDossier *out) {
     if (!format || strcmp(format, "1") != 0) return false;
     if (!kind || strcmp(kind, "dossier") != 0) return false;
     if (!lineage || !valid_id(lineage)) return false;
-    if (!seq || !parse_u64_span(seq, &out->seq, NULL)) return false;
+    if (!seq || !parse_u64(seq, &out->seq)) return false;
     if (!digest || !parse_digest(digest, &out->digest)) return false;
 
     copy_field(out->lineage, sizeof(out->lineage), lineage);
     copy_field(out->effect, sizeof(out->effect), effect ? effect : "unknown");
     copy_field(out->snapshot, sizeof(out->snapshot),
                pair_get(pairs, n, "snapshot"));
-    return (strlen(out->lineage) == 32);
+    return true;
 }
 
 bool zeus_approval_load(const char *path, ZeusApproval *out) {
@@ -409,11 +441,11 @@ bool zeus_approval_load(const char *path, ZeusApproval *out) {
     if (!format || strcmp(format, "1") != 0) return false;
     if (!kind || strcmp(kind, "approval") != 0) return false;
     if (!lineage || !valid_id(lineage)) return false;
-    if (!seq || !parse_u64_span(seq, &out->seq, NULL)) return false;
+    if (!seq || !parse_u64(seq, &out->seq)) return false;
     if (!digest || !parse_digest(digest, &out->digest)) return false;
 
     copy_field(out->lineage, sizeof(out->lineage), lineage);
-    return (strlen(out->lineage) == 32);
+    return true;
 }
 
 bool zeus_approval_write(const ZeusDossier *d, const char *path) {
@@ -484,22 +516,26 @@ void zeus_supervisor_close(ZeusSupervisor *s) {
     }
 }
 
-void zeus_supervisor_set_paths(ZeusSupervisor *s, const char *approval_path,
-                               const char *snapshot_path) {
+void zeus_supervisor_set_paths(ZeusSupervisor *s, const char *snapshot_path) {
     if (!s) return;
 
-    s->approval_path[0] = '\0';
     s->snapshot_path[0] = '\0';
     s->dossier_path[0] = '\0';
 
-    copy_field(s->approval_path, sizeof(s->approval_path), approval_path);
     copy_field(s->snapshot_path, sizeof(s->snapshot_path), snapshot_path);
-    if (s->dossier_path[0] == '\0' && s->snapshot_path[0] != '\0') {
+    if (s->snapshot_path[0] != '\0') {
         size_t n = strlen(s->snapshot_path);
         if (n + 9 > sizeof(s->dossier_path)) n = sizeof(s->dossier_path) - 9;
         memcpy(s->dossier_path, s->snapshot_path, n);
         memcpy(s->dossier_path + n, ".dossier", 9);
     }
+}
+
+void zeus_supervisor_bind_approval(ZeusSupervisor *s, const ZeusApproval *a) {
+    if (!s) return;
+    s->have_approval = a != NULL;
+    if (a) s->approval = *a;
+    else memset(&s->approval, 0, sizeof(s->approval));
 }
 
 uint64_t zeus_supervisor_next_seq(const ZeusSupervisor *s) {
@@ -545,15 +581,12 @@ bool zeus_supervisor_write_dossier(const ZeusSupervisor *s, const ZeusVM *vm,
     return ok;
 }
 
-bool zeus_approval_matches(const char *path, const ZeusSupervisor *s,
-                           const ZeusVM *vm, const ZeusEffect *eff) {
-    if (!path || !s || !vm || !eff) return false;
-
-    ZeusApproval a;
-    if (!zeus_approval_load(path, &a)) return false;
-    if (strcmp(a.lineage, s->lineage_id) != 0) return false;
-    if (a.seq != zeus_supervisor_next_seq(s)) return false;
-    return a.digest == zeus_effect_digest(vm, eff);
+bool zeus_approval_binds(const ZeusApproval *a, const ZeusSupervisor *s,
+                         const ZeusVM *vm, const ZeusEffect *eff) {
+    if (!a || !s || !vm || !eff) return false;
+    if (strcmp(a->lineage, s->lineage_id) != 0) return false;
+    if (a->seq != zeus_supervisor_next_seq(s)) return false;
+    return a->digest == zeus_effect_digest(vm, eff);
 }
 
 /* ------------------------------------------------------------------ */
@@ -602,8 +635,8 @@ ZeusDriveResult zeus_supervisor_drive(ZeusSupervisor *s, ZeusVM *vm,
             }
 
             if (s->ask && zeus_policy_needs_approval(&s->policy, eff.kind)) {
-                if (s->approval_path[0] != '\0') {
-                    if (!zeus_approval_matches(s->approval_path, s, vm, &eff)) {
+                if (s->have_approval) {
+                    if (!zeus_approval_binds(&s->approval, s, vm, &eff)) {
                         if (!deny_effect(s, vm, seq, &eff, digest,
                                          "approval_mismatch")) {
                             set_why(why, why_len, "journal write failed");
@@ -619,7 +652,7 @@ ZeusDriveResult zeus_supervisor_drive(ZeusSupervisor *s, ZeusVM *vm,
                     /* An approval authorises exactly one effect. Reusing it
                      * for the next one would turn a single decision into a
                      * standing grant. */
-                    s->approval_path[0] = '\0';
+                    zeus_supervisor_bind_approval(s, NULL);
                 } else {
                     if (s->snapshot_path[0] == '\0' ||
                         s->dossier_path[0] == '\0') {

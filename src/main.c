@@ -127,8 +127,33 @@ static void build_policy(const Options *o, bool gate, ZeusPolicy *policy) {
 }
 
 /* Drive a machine under a supervisor. Returns a process exit code. */
-static int run_machine(ZeusVM *vm, const Options *o, const char *lineage) {
+static int run_machine(ZeusVM *vm, const Options *o) {
     bool gate = o->ask || o->approve != NULL;
+
+    /* Parse --approve once, before the machine runs and before the journal is
+     * opened. A malformed approval is an operator error (exit 1), not a
+     * refusal of the effect: treating it as a mismatch would kill a parked
+     * machine and spend its sequence number over a typo. */
+    ZeusApproval parsed;
+    const ZeusApproval *approval = NULL;
+    if (o->approve) {
+        if (!zeus_approval_load(o->approve, &parsed)) {
+            fprintf(stderr, "error: approval '%s' is unreadable or malformed\n",
+                    o->approve);
+            return ZEUS_EXIT_ERROR;
+        }
+        if (o->lineage && strcmp(o->lineage, parsed.lineage) != 0) {
+            fprintf(stderr,
+                    "error: --lineage '%s' disagrees with approval lineage '%s'\n",
+                    o->lineage, parsed.lineage);
+            return ZEUS_EXIT_ERROR;
+        }
+        approval = &parsed;
+    }
+
+    /* The approval names the lineage whose accounting the next effect belongs
+     * to. Without one, --lineage (or a fresh lineage) decides. */
+    const char *lineage = approval ? approval->lineage : o->lineage;
 
     /* A gated run can park, so it needs a journal and a parking file. Refuse
      * up front rather than after the program has delivered effects it can no
@@ -150,7 +175,8 @@ static int run_machine(ZeusVM *vm, const Options *o, const char *lineage) {
     }
 
     sup.ask = gate;
-    zeus_supervisor_set_paths(&sup, o->approve, o->save);
+    zeus_supervisor_set_paths(&sup, o->save);
+    zeus_supervisor_bind_approval(&sup, approval);
 
     if (sup.ambiguous) {
         fprintf(stderr,
@@ -232,8 +258,7 @@ static int load_program(ZeusProgram *prog, const char *path) {
     return 0;
 }
 
-static int run_program(const ZeusProgram *prog, const Options *o,
-                       const char *lineage) {
+static int run_program(const ZeusProgram *prog, const Options *o) {
     ZeusVM vm;
     zeus_vm_init(&vm);
 
@@ -244,7 +269,7 @@ static int run_program(const ZeusProgram *prog, const Options *o,
         return ZEUS_EXIT_ERROR;
     }
 
-    int rc = run_machine(&vm, o, lineage);
+    int rc = run_machine(&vm, o);
     zeus_vm_free(&vm);
     return rc;
 }
@@ -252,27 +277,12 @@ static int run_program(const ZeusProgram *prog, const Options *o,
 static int cmd_run(const Options *o) {
     ZeusProgram prog;
     if (load_program(&prog, o->in) != 0) return ZEUS_EXIT_ERROR;
-    int rc = run_program(&prog, o, o->lineage);
+    int rc = run_program(&prog, o);
     zeus_program_free(&prog);
     return rc;
 }
 
 static int cmd_restore(const Options *o) {
-    /* The approval names the lineage whose accounting the pending effect
-     * belongs to. Without one, the machine runs under a fresh lineage. */
-    char lineage[ZEUS_ID_LEN];
-    const char *lin = o->lineage;
-
-    if (o->approve) {
-        ZeusApproval a;
-        if (!zeus_approval_load(o->approve, &a)) {
-            fprintf(stderr, "error: cannot read approval '%s'\n", o->approve);
-            return ZEUS_EXIT_ERROR;
-        }
-        snprintf(lineage, sizeof(lineage), "%s", a.lineage);
-        lin = lineage;
-    }
-
     /* A restore that may park needs somewhere to write the machine. The file
      * we just loaded is the natural parking file, and using it is what lets a
      * second sensitive effect park instead of failing for a missing path.
@@ -294,7 +304,7 @@ static int cmd_restore(const Options *o) {
         return ZEUS_EXIT_ERROR;
     }
 
-    int rc = run_machine(&vm, &opts, lin);
+    int rc = run_machine(&vm, &opts);
     zeus_vm_free(&vm);
     return rc;
 }
@@ -311,7 +321,7 @@ static int cmd_save(const Options *o) {
     Options opts = *o;
     opts.save = o->out;
 
-    int rc = run_program(&prog, &opts, o->lineage);
+    int rc = run_program(&prog, &opts);
     zeus_program_free(&prog);
     return rc;
 }
@@ -477,7 +487,7 @@ static int cmd_run_asm(const Options *o) {
         return ZEUS_EXIT_ERROR;
     }
 
-    int rc = run_program(&prog, o, o->lineage);
+    int rc = run_program(&prog, o);
     zeus_program_free(&prog);
     return rc;
 }
