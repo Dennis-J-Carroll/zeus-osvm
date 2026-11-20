@@ -277,6 +277,15 @@ Decisions locked while building M4:
 - **Zero dependencies, single string** — no template engine, inline CSS, opens
   on a phone. Consistent with the Glassport family and MO's no-C-import rule.
 
+**M5 — Pre-delivery gate. ✅ DONE.** `engine.Judge.observe()` evaluates one
+event without finalising: no end-of-stream BOLT, no wall clock. `finish()` is
+the only finaliser. `mo/gate.py` wraps that in a `Gate` returning `ALLOW`,
+`DENY` or `ESCALATE` *before* an effect is delivered. `ALLOW` requires a rule to
+claim the event; an unmatched effect **escalates** rather than passing as "fine"
+(premortem #5), and an ASSERT violation denies. The gate judges on a forked
+ledger and commits only on `ALLOW`, so a refused effect never enters MO's state.
+65 passed, 2 skipped.
+
 ---
 
 ## 7. PREMORTEM — how MO is wrong in 6 months

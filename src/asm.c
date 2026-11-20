@@ -397,6 +397,35 @@ ZeusError zeus_assemble(const char *source, ZeusProgram *out_prog, char *err_buf
         return ZEUS_ERR_IO;
     }
 
+    if (a.code.len == 0) {
+        if (err_buf && err_len > 0) {
+            snprintf(err_buf, err_len, "no instructions emitted");
+        }
+        free(src);
+        asm_free(&a);
+        return ZEUS_ERR_BAD_BYTECODE;
+    }
+    if (a.data.len > ZEUS_MEMORY_SIZE) {
+        if (err_buf && err_len > 0) {
+            snprintf(err_buf, err_len,
+                     "data section is %zu bytes, exceeds VM memory (%d bytes)",
+                     a.data.len, ZEUS_MEMORY_SIZE);
+        }
+        free(src);
+        asm_free(&a);
+        return ZEUS_ERR_BAD_BYTECODE;
+    }
+    if (a.code.len > ZEUS_MAX_CODE_SIZE) {
+        if (err_buf && err_len > 0) {
+            snprintf(err_buf, err_len,
+                     "code section is %zu bytes, exceeds limit (%u bytes)",
+                     a.code.len, ZEUS_MAX_CODE_SIZE);
+        }
+        free(src);
+        asm_free(&a);
+        return ZEUS_ERR_BAD_BYTECODE;
+    }
+
     zeus_program_init(out_prog);
     out_prog->header.magic[0] = ZEUS_MAGIC[0];
     out_prog->header.magic[1] = ZEUS_MAGIC[1];
