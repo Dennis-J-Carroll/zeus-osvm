@@ -3,6 +3,8 @@
 #include "supervisor.h"
 #include "snapshot.h"
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -501,12 +503,28 @@ bool zeus_supervisor_open(ZeusSupervisor *s, const ZeusPolicy *policy,
 
     if (!journal_path) return true;
 
+    /* Append, never truncate: the audit trail outlives the process. */
+    int fd = open(journal_path, O_RDWR | O_CREAT | O_APPEND, 0666);
+    if (fd < 0) return false;
+
+    /* The lock is taken before the counter is scanned: two supervisors could
+     * otherwise read the same last seq and mint the same number. A second
+     * supervisor fails instead of waiting behind a machine that may run for a
+     * long time. The lock lives as long as the FILE, i.e. until close. */
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        s->journal_busy = true;
+        close(fd);
+        return false;
+    }
+
     scan_journal(journal_path, s->lineage_id, &s->seq, &s->ambiguous,
                  &s->ambiguous_seq);
 
-    /* Append, never truncate: the audit trail outlives the process. */
-    s->journal = fopen(journal_path, "a");
-    if (!s->journal) return false;
+    s->journal = fdopen(fd, "a");
+    if (!s->journal) {
+        close(fd);
+        return false;
+    }
 
     /* Never append a `start` behind an unmatched intent: that record would
      * make the next retry look clean and replay an effect that may already

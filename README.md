@@ -72,7 +72,9 @@ natural policy point:
   handing the program a failure result it can ignore.
 - **Append-only audit** — `--journal F` writes `intent` before each effect and
   `commit` after, with a supervisor-owned sequence number and a digest of the
-  resolved operands. A crash between the two is refused on every retry: a
+  resolved operands. The journal is held under an exclusive lock for the life
+  of the supervisor, so two processes cannot scan the same counter and mint the
+  same number. A crash between intent and commit is refused on every retry: a
   refused open writes nothing, so the unmatched intent is never erased.
 - **Approval gate** — `--ask` (or `--approve`) parks the machine with the
   effect pending and writes a dossier; `zeus approve` checks the digest against
