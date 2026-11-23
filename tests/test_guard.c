@@ -2,6 +2,9 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 #include "zeus.h"
 #include "vm.h"
 #include "asm.h"
@@ -417,6 +420,12 @@ static int test_uncommitted_intent_refuses(void) {
              "{\"seq\":1,\"event\":\"intent\",\"machine\":\"%s\","
              "\"lineage\":\"%s\",\"effect\":\"send\"}", seed.machine_id, lineage);
     ok = ok && append_line(j, line);
+    /* An older build appended a start record after the unmatched intent.
+     * The scan must look through it; otherwise that journal now looks clean. */
+    snprintf(line, sizeof(line),
+             "{\"seq\":0,\"event\":\"start\",\"machine\":\"%s\",\"lineage\":\"%s\"}",
+             seed.machine_id, lineage);
+    ok = ok && append_line(j, line);
 
     ZeusPolicy p;
     zeus_policy_init(&p, ZEUS_PROFILE_STANDARD);
@@ -510,6 +519,47 @@ static int test_ambiguity_survives_retries(void) {
 
     zeus_vm_free(&vm);
     zeus_program_free(&prog);
+    remove(j);
+    return ok;
+}
+
+/* Two supervisors that both scanned the same journal would mint the same
+ * sequence number. The journal is locked before the scan, so the second open
+ * fails and writes nothing. */
+static int test_journal_lock_is_exclusive(void) {
+    const char *j = "/tmp/zeus_guard_lock.log";
+    remove(j);
+
+    int fd = open(j, O_RDWR | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) return 0;
+    int ok = (flock(fd, LOCK_EX | LOCK_NB) == 0);
+
+    ZeusPolicy p;
+    zeus_policy_init(&p, ZEUS_PROFILE_STANDARD);
+
+    ZeusSupervisor s;
+    ok = ok && !zeus_supervisor_open(&s, &p, j, NULL);
+    ok = ok && s.journal_busy;
+
+    /* The refused open must not have appended a start record. */
+    char *txt = slurp(j);
+    ok = ok && txt && (count_substr(txt, "\"event\":\"start\"") == 0);
+    free(txt);
+
+    ok = ok && (flock(fd, LOCK_UN) == 0);
+    ok = ok && (close(fd) == 0);
+
+    if (ok) {
+        ZeusSupervisor s2;
+        ok = zeus_supervisor_open(&s2, &p, j, NULL) && !s2.journal_busy;
+        if (ok) {
+            txt = slurp(j);
+            ok = txt && (count_substr(txt, "\"event\":\"start\"") == 1);
+            free(txt);
+            zeus_supervisor_close(&s2);
+        }
+    }
+
     remove(j);
     return ok;
 }
@@ -696,6 +746,7 @@ int main(void) {
     RUN_TEST(test_denial_spends_its_sequence);
     RUN_TEST(test_uncommitted_intent_refuses);
     RUN_TEST(test_ambiguity_survives_retries);
+    RUN_TEST(test_journal_lock_is_exclusive);
     RUN_TEST(test_dossier_rejects_hostile_input);
     RUN_TEST(test_approval_rejects_hostile_input);
 

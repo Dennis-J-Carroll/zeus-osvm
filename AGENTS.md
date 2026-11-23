@@ -112,7 +112,7 @@ python3 -m mo report spec.zspec trace.jsonl -o out.html  # self-contained HTML t
 
 ## Verified Working
 
-`make` builds all three binaries; `make test` passes 4/4 + 3/3 + 12/12 + 10/10 + 10/10 (VM, assembler, safety, snapshot, protection) plus the 28-check `tests/test_ask.sh` approval flow; `make check` passes under ASan + UBSan. `make smoke` passes 8/8. `hello`, `echo_server`, `http_server`, `boot_splash` examples run; `raw_ping` needs `CAP_NET_RAW`/root and `--allow-raw`. MO: `python3 -m pytest mo/` passes 65, 2 skipped (the live dogfood is marked `slow`). `zeus jail --check` reports seccomp working (raw sockets denied with EPERM); the namespace layer depends on the host allowing unprivileged user namespaces and fails closed when it does not.
+`make` builds all three binaries; `make test` passes 4/4 + 3/3 + 12/12 + 10/10 + 11/11 (VM, assembler, safety, snapshot, protection) plus the 28-check `tests/test_ask.sh` approval flow; `make check` passes under ASan + UBSan. `make smoke` passes 8/8. `hello`, `echo_server`, `http_server`, `boot_splash` examples run; `raw_ping` needs `CAP_NET_RAW`/root and `--allow-raw`. MO: `python3 -m pytest mo/` passes 65, 2 skipped (the live dogfood is marked `slow`). `zeus jail --check` reports seccomp working (raw sockets denied with EPERM); the namespace layer depends on the host allowing unprivileged user namespaces and fails closed when it does not.
 
 Recent additions:
 - Correlation ids: `ZeusEvent` and `Obligation` carry a `correlation` field so

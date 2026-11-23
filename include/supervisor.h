@@ -57,6 +57,7 @@ typedef struct {
 
 typedef struct {
     FILE *journal;
+    bool journal_busy;         /* open failed: another supervisor holds the lock */
     ZeusPolicy policy;
     char machine_id[ZEUS_ID_LEN];
     char lineage_id[ZEUS_ID_LEN];

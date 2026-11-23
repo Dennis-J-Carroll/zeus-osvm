@@ -150,8 +150,11 @@ loosen it.
 ### 3.3 The audit journal
 
 `--journal F` writes JSONL and opens `F` for **append**; an existing journal is
-never truncated. Every delivered effect produces an `intent` record, flushed
-and fsynced before the effect reaches the host, then a `commit`:
+never truncated. The file is held under an exclusive `flock` for as long as the
+supervisor lives, and the lock is taken before the counter is scanned, so a
+second supervisor fails (exit 1) instead of minting the same sequence number.
+Every delivered effect produces an `intent` record, flushed and fsynced before
+the effect reaches the host, then a `commit`:
 
 ```json
 {"seq":1,"event":"intent","machine":"…","lineage":"…","effect":"send","fd":3,"buf":1024,"len":16,"digest":"0x…"}
@@ -164,7 +167,9 @@ machines cannot reuse a sequence number. If a process dies between `intent` and
 `commit`, the next run on that lineage refuses to start: the effect may already
 have happened, and replaying it silently is exactly what the record exists to
 prevent. A refused open writes nothing, so the unmatched intent stays the last
-record and every retry keeps refusing instead of erasing the evidence.
+record and every retry keeps refusing instead of erasing the evidence. `start`
+records are transparent to the scan, so a journal damaged by an older build
+(an intent followed by a `start`) is still recognised as ambiguous.
 
 ### 3.4 Approval: park, approve, resume, deny
 

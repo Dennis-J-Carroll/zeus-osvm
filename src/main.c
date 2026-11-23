@@ -168,9 +168,15 @@ static int run_machine(ZeusVM *vm, const Options *o) {
 
     ZeusSupervisor sup;
     if (!zeus_supervisor_open(&sup, &policy, o->journal, lineage)) {
-        fprintf(stderr, "error: cannot open supervisor");
-        if (o->journal) fprintf(stderr, " (journal '%s')", o->journal);
-        fprintf(stderr, "\n");
+        if (sup.journal_busy) {
+            fprintf(stderr,
+                    "error: journal '%s' is held by another supervisor\n",
+                    o->journal);
+        } else {
+            fprintf(stderr, "error: cannot open supervisor");
+            if (o->journal) fprintf(stderr, " (journal '%s')", o->journal);
+            fprintf(stderr, "\n");
+        }
         return ZEUS_EXIT_ERROR;
     }
 
@@ -326,6 +332,48 @@ static int cmd_save(const Options *o) {
     return rc;
 }
 
+/* Restore the machine a dossier names and check that its pending effect is
+ * the one the dossier describes. On success the caller owns `vm`; otherwise
+ * it is freed and the returned code says why. A missing or unreadable machine
+ * is an operator error; a well-formed dossier naming a different machine is a
+ * refusal, the same as deny would give. seq and lineage belong to the journal,
+ * so they are checked again when the approval is used. */
+static int load_dossier_machine(const ZeusDossier *d, ZeusVM *vm,
+                                uint64_t *digest) {
+    zeus_vm_init(vm);
+
+    if (d->snapshot[0] == '\0') {
+        fprintf(stderr, "error: dossier does not name a snapshot\n");
+        return ZEUS_EXIT_ERROR;
+    }
+
+    ZeusError err = zeus_vm_restore(vm, d->snapshot);
+    if (err != ZEUS_OK) {
+        fprintf(stderr, "error restoring '%s': %s\n", d->snapshot,
+                zeus_error_string(err));
+        zeus_vm_free(vm);
+        return ZEUS_EXIT_ERROR;
+    }
+    if (!vm->yielded) {
+        fprintf(stderr, "error: machine in '%s' has no pending effect\n",
+                d->snapshot);
+        zeus_vm_free(vm);
+        return ZEUS_EXIT_ERROR;
+    }
+
+    *digest = zeus_effect_digest(vm, &vm->pending);
+    if (*digest != d->digest) {
+        fprintf(stderr,
+                "error: dossier digest 0x%016llx does not match machine in "
+                "'%s' (0x%016llx); refusing to act on a different machine\n",
+                (unsigned long long)d->digest, d->snapshot,
+                (unsigned long long)*digest);
+        zeus_vm_free(vm);
+        return ZEUS_EXIT_DENIED;
+    }
+    return ZEUS_EXIT_OK;
+}
+
 static int cmd_approve(const char *dossier_path, const char *out_path) {
     ZeusDossier d;
     if (!zeus_dossier_load(dossier_path, &d)) {
@@ -333,43 +381,10 @@ static int cmd_approve(const char *dossier_path, const char *out_path) {
         return ZEUS_EXIT_ERROR;
     }
 
-    /* Approve the machine the dossier describes, not the text of the dossier:
-     * restore the snapshot it names and bind to that pending effect's digest.
-     * seq and lineage belong to the journal, so they are checked again when
-     * the approval is used. */
-    if (d.snapshot[0] == '\0') {
-        fprintf(stderr, "error: dossier does not name a snapshot\n");
-        return ZEUS_EXIT_ERROR;
-    }
-
     ZeusVM vm;
-    zeus_vm_init(&vm);
-
-    ZeusError err = zeus_vm_restore(&vm, d.snapshot);
-    if (err != ZEUS_OK) {
-        fprintf(stderr, "error restoring '%s': %s\n", d.snapshot,
-                zeus_error_string(err));
-        zeus_vm_free(&vm);
-        return ZEUS_EXIT_ERROR;
-    }
-    if (!vm.yielded) {
-        fprintf(stderr,
-                "error: machine in '%s' has no pending effect to approve\n",
-                d.snapshot);
-        zeus_vm_free(&vm);
-        return ZEUS_EXIT_ERROR;
-    }
-
-    uint64_t digest = zeus_effect_digest(&vm, &vm.pending);
-    if (digest != d.digest) {
-        fprintf(stderr,
-                "error: dossier digest 0x%016llx does not match snapshot "
-                "'%s' (0x%016llx); refusing to approve a different machine\n",
-                (unsigned long long)d.digest, d.snapshot,
-                (unsigned long long)digest);
-        zeus_vm_free(&vm);
-        return ZEUS_EXIT_DENIED;
-    }
+    uint64_t digest;
+    int rc = load_dossier_machine(&d, &vm, &digest);
+    if (rc != ZEUS_EXIT_OK) return rc;
     zeus_vm_free(&vm);
 
     char default_out[ZEUS_PATH_LEN];
@@ -401,44 +416,23 @@ static int cmd_deny(const Options *o) {
         fprintf(stderr, "error: cannot read dossier '%s'\n", o->in);
         return ZEUS_EXIT_ERROR;
     }
-    if (d.snapshot[0] == '\0') {
-        fprintf(stderr, "error: dossier does not name a snapshot\n");
-        return ZEUS_EXIT_ERROR;
-    }
-
     ZeusVM vm;
-    zeus_vm_init(&vm);
-
-    ZeusError err = zeus_vm_restore(&vm, d.snapshot);
-    if (err != ZEUS_OK) {
-        fprintf(stderr, "error restoring '%s': %s\n",
-                d.snapshot, zeus_error_string(err));
-        zeus_vm_free(&vm);
-        return ZEUS_EXIT_ERROR;
-    }
-
-    if (!vm.yielded) {
-        fprintf(stderr, "error: machine has no pending effect to deny\n");
-        zeus_vm_free(&vm);
-        return ZEUS_EXIT_ERROR;
-    }
-
-    uint64_t digest = zeus_effect_digest(&vm, &vm.pending);
-    if (digest != d.digest) {
-        fprintf(stderr,
-                "error: dossier digest 0x%016llx does not match this machine "
-                "(0x%016llx); refusing to act on a different machine\n",
-                (unsigned long long)d.digest, (unsigned long long)digest);
-        zeus_vm_free(&vm);
-        return ZEUS_EXIT_DENIED;
-    }
+    uint64_t digest;
+    int rc = load_dossier_machine(&d, &vm, &digest);
+    if (rc != ZEUS_EXIT_OK) return rc;
 
     ZeusPolicy policy;
     zeus_policy_init(&policy, ZEUS_PROFILE_DENY_ALL);
 
     ZeusSupervisor sup;
     if (!zeus_supervisor_open(&sup, &policy, o->journal, d.lineage)) {
-        fprintf(stderr, "error: cannot open supervisor\n");
+        if (sup.journal_busy) {
+            fprintf(stderr,
+                    "error: journal '%s' is held by another supervisor\n",
+                    o->journal);
+        } else {
+            fprintf(stderr, "error: cannot open supervisor\n");
+        }
         zeus_vm_free(&vm);
         return ZEUS_EXIT_ERROR;
     }
