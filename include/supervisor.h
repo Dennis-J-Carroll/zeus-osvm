@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include "vm.h"
 #include "policy.h"
+#include "snapshot.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,11 +31,17 @@ extern "C" {
 #define ZEUS_ID_LEN   33      /* 32 hex chars + NUL */
 #define ZEUS_PATH_LEN 1024
 
+/* The one audit-id rule, shared by the supervisor and the journal parser:
+ * exactly 32 hex characters (0-9, a-f, A-F). */
+bool zeus_valid_id(const char *s);
+
 typedef enum {
     ZEUS_DRIVE_HALTED = 0,     /* program halted cleanly */
     ZEUS_DRIVE_STEP_LIMIT,     /* stopped at the instruction budget */
     ZEUS_DRIVE_NEEDS_APPROVAL, /* parked with a pending effect */
     ZEUS_DRIVE_DENIED,         /* policy or approval refused the effect */
+    ZEUS_DRIVE_DENY_UNRECORDED,/* the effect was refused but the journal
+                                * could not record the refusal */
     ZEUS_DRIVE_FAILED          /* VM error, I/O error or ambiguous journal */
 } ZeusDriveResult;
 
@@ -55,6 +62,16 @@ typedef struct {
     uint64_t digest;
 } ZeusApproval;
 
+/* Result of `zeus journal verify`. `line` is the first divergent record (0
+ * when the chain is clean). A legacy journal is structurally valid but its
+ * chain cannot be verified; --allow-legacy turns that into a warning. */
+typedef struct {
+    uint64_t line;
+    uint64_t records;
+    bool legacy;
+    char reason[256];
+} ZeusJournalVerify;
+
 typedef struct {
     FILE *journal;
     bool journal_busy;         /* open failed: another supervisor holds the lock */
@@ -64,6 +81,9 @@ typedef struct {
     uint64_t seq;              /* last committed effect number */
     bool ambiguous;            /* journal ends in an unmatched intent */
     uint64_t ambiguous_seq;
+    uint64_t head_hash;        /* FNV-1a of the last journal record */
+    bool chain_unverified;     /* journal has legacy records without prev */
+    char journal_error[256];   /* why open refused, when it was not the lock */
     bool ask;                  /* park instead of delivering sensitive effects */
 
     bool have_approval;        /* an approval is bound to the next effect */
@@ -106,10 +126,11 @@ ZeusDriveResult zeus_supervisor_drive(ZeusSupervisor *s, ZeusVM *vm,
 
 /* Operator denial: journal the effect at its next sequence number, then kill
  * the machine at the seam. The effect is never delivered, so a denied program
- * cannot ignore the refusal and continue. The refusal spends its sequence
- * number, so a denied effect can never later be approved under the same seq.
- * Returns false if the denial could not be journaled; the machine is halted
- * either way. */
+ * cannot ignore the refusal and continue. A recorded refusal spends its
+ * sequence number, so a denied effect can never later be approved under the
+ * same seq. Returns whether the refusal reached the journal; the effect is
+ * cancelled and the machine halted either way, and an unrecorded refusal does
+ * not advance the counter (the journal's last committed number stays true). */
 bool zeus_supervisor_deny(ZeusSupervisor *s, ZeusVM *vm, const char *reason);
 
 /* Dossier / approval files. Approval is keyed by (lineage, seq, digest) and is
@@ -125,6 +146,34 @@ bool zeus_approval_load(const char *path, ZeusApproval *out);
 /* True only if `a` approves exactly this pending effect of this machine. */
 bool zeus_approval_binds(const ZeusApproval *a, const ZeusSupervisor *s,
                          const ZeusVM *vm, const ZeusEffect *eff);
+
+/* True only if the snapshot's binding metadata may back the machine a dossier
+ * describes. An unbound snapshot (empty lineage, seq 0) can never match a
+ * dossier, whose sequence numbers start at 1. On mismatch `why` explains what
+ * disagreed; it is left untouched on success. */
+bool zeus_snapshot_matches_dossier(const ZeusSnapshotMeta *m,
+                                   const ZeusDossier *d,
+                                   char *why, size_t why_len);
+
+/* Walk a journal's hash chain and sequence accounting. Returns true when the
+ * chain is clean (or legacy records are accepted with `allow_legacy`). On
+ * failure `out->line` names the first divergent record and `out->reason` says
+ * what broke. `lineage` restricts the sequence checks to one audit chain. */
+bool zeus_journal_verify(const char *path, const char *lineage,
+                         bool allow_legacy, ZeusJournalVerify *out);
+
+/* Close an open intent: appends a `resolve` record under the same exclusive
+ * lock, spending `seq`. Refuses when there is no open intent at `seq` or when
+ * more than one lineage has one. */
+bool zeus_journal_resolve(const char *path, uint64_t seq,
+                          const char *outcome, const char *reason,
+                          char *why, size_t why_len);
+
+/* True only when `head` occurs in the journal's hash chain. Snapshot writes
+ * record the head at the park record; restore and deny use this to refuse a
+ * machine parked against a different journal. `head` 0 means unbound. */
+bool zeus_journal_contains_head(const char *path, uint64_t head, bool *found,
+                                char *why, size_t why_len);
 
 #ifdef __cplusplus
 }

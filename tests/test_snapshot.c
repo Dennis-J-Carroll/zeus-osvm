@@ -1,7 +1,14 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <dirent.h>
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "zeus.h"
 #include "vm.h"
 #include "../src/net.h"   /* packet-slot internals, for the fork test */
@@ -22,7 +29,8 @@ static int tests_failed = 0;
     } \
 } while (0)
 
-/* Snapshot format 2 header offsets: 8-byte magic, then u32 fields. */
+/* Snapshot header offsets (shared by formats 2 and 3): 8-byte magic, then
+ * u32 fields. */
 enum {
     SNAP_OFF_FORMAT = 8,
     SNAP_OFF_CODE_LEN = 12,
@@ -151,15 +159,102 @@ static int patch_snapshot(const char *src, const char *dst,
     return written == (size_t)n && closed == 0;
 }
 
+static int rejects_file(const char *path) {
+    ZeusVM vm;
+    zeus_vm_init(&vm);
+    ZeusError e = zeus_vm_restore(&vm, path);
+    zeus_vm_free(&vm);
+    return e == ZEUS_ERR_SNAPSHOT;
+}
+
 static int rejected_after_patch(const char *src, const char *dst,
                                 const Patch *patches, size_t count) {
     if (!patch_snapshot(src, dst, patches, count)) return 0;
+    return rejects_file(dst);
+}
 
-    ZeusVM vm;
-    zeus_vm_init(&vm);
-    ZeusError e = zeus_vm_restore(&vm, dst);
-    zeus_vm_free(&vm);
-    return e == ZEUS_ERR_SNAPSHOT;
+/* Overwrite one byte and recompute the checksum, so the file stays
+ * self-consistent and only the field under test can justify a rejection. */
+static int patch_snapshot_byte(const char *src, const char *dst,
+                               size_t off, uint8_t value) {
+    FILE *f = fopen(src, "rb");
+    if (!f) return 0;
+
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+    long n = ftell(f);
+    if (n < 8) { fclose(f); return 0; }
+    rewind(f);
+
+    uint8_t *buf = (uint8_t *)malloc((size_t)n);
+    if (!buf) { fclose(f); return 0; }
+    size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    if (got != (size_t)n || off >= (size_t)n - 8) { free(buf); return 0; }
+
+    buf[off] = value;
+    uint64_t h = fnv1a(buf, (size_t)n - 8);
+    for (int i = 0; i < 8; i++) {
+        buf[(size_t)n - 8 + i] = (uint8_t)((h >> (8 * i)) & 0xFF);
+    }
+
+    f = fopen(dst, "wb");
+    if (!f) { free(buf); return 0; }
+    size_t written = fwrite(buf, 1, (size_t)n, f);
+    int closed = fclose(f);
+    free(buf);
+    return written == (size_t)n && closed == 0;
+}
+
+static int files_identical(const char *a, const char *b) {
+    FILE *fa = fopen(a, "rb");
+    FILE *fb = fopen(b, "rb");
+    if (!fa || !fb) {
+        if (fa) fclose(fa);
+        if (fb) fclose(fb);
+        return 0;
+    }
+
+    int same = 1;
+    for (;;) {
+        int ca = fgetc(fa);
+        int cb = fgetc(fb);
+        if (ca != cb) { same = 0; break; }
+        if (ca == EOF) break;
+    }
+    fclose(fa);
+    fclose(fb);
+    return same;
+}
+
+static int copy_file(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    FILE *out = fopen(dst, "wb");
+    if (!in || !out) {
+        if (in) fclose(in);
+        if (out) fclose(out);
+        return 0;
+    }
+
+    int ok = 1;
+    int ch;
+    while ((ch = fgetc(in)) != EOF) {
+        if (fputc(ch, out) == EOF) { ok = 0; break; }
+    }
+    if (fclose(in) != 0) ok = 0;
+    if (fclose(out) != 0) ok = 0;
+    return ok;
+}
+
+static int dir_has_temp(const char *dir) {
+    DIR *d = opendir(dir);
+    if (!d) return 1;
+    int found = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strstr(ent->d_name, ".tmp.") != NULL) { found = 1; break; }
+    }
+    closedir(d);
+    return found;
 }
 
 static int test_roundtrip_resumes_exactly(void) {
@@ -490,6 +585,165 @@ static int test_packet_slot_ids_survive(void) {
     return ok;
 }
 
+static int test_v2_snapshot_rejected(void) {
+    const char *src = "/tmp/zeus_snap_v2_src.zsnap";
+    const char *dst = "/tmp/zeus_snap_v2_dst.zsnap";
+
+    ZeusProgram prog;
+    ZeusVM a;
+    if (!build(&prog, &a)) return 0;
+
+    int ok = exec_n(&a, 3);
+    ok = ok && (zeus_vm_snapshot(&a, src) == ZEUS_OK);
+
+    /* Old magic with a matching checksum: the version, not corruption, is
+     * what must justify the refusal. */
+    ok = ok && patch_snapshot_byte(src, dst, 5, '2');
+    ok = ok && rejects_file(dst);
+
+    /* New magic but a header that still says format 2. */
+    Patch old_format[] = { { SNAP_OFF_FORMAT, 2 } };
+    ok = ok && rejected_after_patch(src, dst, old_format, 1);
+
+    zeus_vm_free(&a);
+    zeus_program_free(&prog);
+    remove(src);
+    remove(dst);
+    return ok;
+}
+
+static int test_bound_snapshot_roundtrip(void) {
+    const char *p1 = "/tmp/zeus_snap_bound_a.zsnap";
+    const char *p2 = "/tmp/zeus_snap_bound_b.zsnap";
+    const char *lineage = "0123456789abcdef0123456789abcdef";
+
+    ZeusProgram prog;
+    ZeusVM a;
+    if (!build(&prog, &a)) return 0;
+
+    int ok = exec_n(&a, 3);
+    ok = ok && (zeus_vm_snapshot_bound(&a, p1, lineage, 7) == ZEUS_OK);
+
+    ZeusVM b;
+    zeus_vm_init(&b);
+    ZeusSnapshotMeta meta;
+    memset(&meta, 0, sizeof(meta));
+    ok = ok && (zeus_vm_restore_ex(&b, p1, &meta) == ZEUS_OK);
+    ok = ok && (strcmp(meta.lineage, lineage) == 0);
+    ok = ok && (meta.seq == 7);
+    ok = ok && (meta.journal_head == 0);
+
+    /* Writing the restored state with the same binding is byte-identical: the
+     * metadata is part of the deterministic payload. */
+    ok = ok && (zeus_vm_snapshot_bound(&b, p2, lineage, 7) == ZEUS_OK);
+    ok = ok && files_identical(p1, p2);
+
+    ok = ok && run_to_end(&b);
+    ok = ok && (b.error == ZEUS_OK);
+    ok = ok && (b.memory[100] == 7);
+
+    /* A malformed lineage is refused before anything is written, and a
+     * too-long id is not truncated into a different valid one. */
+    ok = ok && (zeus_vm_snapshot_bound(&a, p2, "not-a-lineage", 1)
+                == ZEUS_ERR_SNAPSHOT);
+    ok = ok && (zeus_vm_snapshot_bound(
+                    &a, p2, "0123456789abcdef0123456789abcdef01234567", 1)
+                == ZEUS_ERR_SNAPSHOT);
+
+    zeus_vm_free(&b);
+    zeus_vm_free(&a);
+    zeus_program_free(&prog);
+    remove(p1);
+    remove(p2);
+    return ok;
+}
+
+static int test_unbound_snapshot_roundtrip(void) {
+    const char *p1 = "/tmp/zeus_snap_unbound.zsnap";
+
+    ZeusProgram prog;
+    ZeusVM a;
+    if (!build(&prog, &a)) return 0;
+
+    int ok = exec_n(&a, 3);
+    ok = ok && (zeus_vm_snapshot(&a, p1) == ZEUS_OK);
+
+    ZeusVM b;
+    zeus_vm_init(&b);
+    ZeusSnapshotMeta meta;
+    memset(&meta, 0xff, sizeof(meta));
+    ok = ok && (zeus_vm_restore_ex(&b, p1, &meta) == ZEUS_OK);
+    ok = ok && (meta.lineage[0] == '\0');
+    ok = ok && (meta.seq == 0);
+    ok = ok && (meta.journal_head == 0);
+
+    ok = ok && run_to_end(&b);
+    ok = ok && (b.memory[100] == 7);
+
+    zeus_vm_free(&b);
+    zeus_vm_free(&a);
+    zeus_program_free(&prog);
+    remove(p1);
+    return ok;
+}
+
+static int test_snapshot_write_is_atomic(void) {
+    char dir[] = "/tmp/zeus_snap_atomicXXXXXX";
+    if (!mkdtemp(dir)) return 0;
+
+    char good[600], backup[600];
+    snprintf(good, sizeof(good), "%s/good.zsnap", dir);
+    snprintf(backup, sizeof(backup), "%s/good.backup", dir);
+
+    ZeusProgram prog;
+    ZeusVM a;
+    if (!build(&prog, &a)) { rmdir(dir); return 0; }
+
+    int ok = exec_n(&a, 3);
+    ok = ok && (zeus_vm_snapshot(&a, good) == ZEUS_OK);
+    ok = ok && copy_file(good, backup);
+
+    /* A directory without write permission refuses the temporary file before
+     * the destination is touched. */
+    ok = ok && (chmod(dir, 0500) == 0);
+    ZeusError e = zeus_vm_snapshot(&a, good);
+    ok = ok && (chmod(dir, 0700) == 0);
+
+    int refused = (e != ZEUS_OK);
+    if (!refused && geteuid() == 0) {
+        /* root bypasses directory permissions: force the write itself to fail
+         * so the same property (old file intact, temp removed) is proven. */
+        struct rlimit old, rl;
+        ok = ok && (getrlimit(RLIMIT_FSIZE, &old) == 0);
+        rl = old;
+        rl.rlim_cur = 1024;
+
+        struct sigaction ign, prev;
+        memset(&ign, 0, sizeof(ign));
+        ign.sa_handler = SIG_IGN;
+        sigemptyset(&ign.sa_mask);
+        ok = ok && (sigaction(SIGXFSZ, &ign, &prev) == 0);
+        ok = ok && (setrlimit(RLIMIT_FSIZE, &rl) == 0);
+
+        e = zeus_vm_snapshot(&a, good);
+
+        (void)setrlimit(RLIMIT_FSIZE, &old);
+        (void)sigaction(SIGXFSZ, &prev, NULL);
+        refused = (e != ZEUS_OK);
+    }
+
+    ok = ok && refused;
+    ok = ok && files_identical(good, backup);
+    ok = ok && !dir_has_temp(dir);
+
+    zeus_vm_free(&a);
+    zeus_program_free(&prog);
+    remove(good);
+    remove(backup);
+    rmdir(dir);
+    return ok;
+}
+
 static int test_snapshot_rejects_inconsistent_machine(void) {
     const char *p1 = "/tmp/zeus_snap_bad_machine.zsnap";
 
@@ -528,6 +782,10 @@ int main(void) {
     RUN_TEST(test_restore_rejects_inconsistent_state);
     RUN_TEST(test_packet_slot_ids_survive);
     RUN_TEST(test_snapshot_rejects_inconsistent_machine);
+    RUN_TEST(test_v2_snapshot_rejected);
+    RUN_TEST(test_bound_snapshot_roundtrip);
+    RUN_TEST(test_unbound_snapshot_roundtrip);
+    RUN_TEST(test_snapshot_write_is_atomic);
 
     printf("\n%d/%d tests passed\n", tests_run - tests_failed, tests_run);
     return tests_failed > 0 ? 1 : 0;

@@ -1,0 +1,12 @@
+; Wire-order fabrication policy for live sessions.
+;
+; A tools/list declaration can cross the wire just after a call it authorises.
+; GRACE gives that declaration 500ms to arrive. A call still undeclared at the
+; deadline is CONDEMNED; a declaration within the window resolves it. The
+; liveness rule is additive, so a declared tool must still be called once.
+
+on tool_declared as $tool:
+    EXPECT tool_called for $tool
+    WINDOW 5000
+
+ASSERT no tool_called where identifier not in tool_declared GRACE 500

@@ -1,6 +1,7 @@
 from mo.events import ZeusEvent
 from mo.engine import Judge
 from mo.gate import ALLOW, DENY, ESCALATE, Gate
+from mo.parser import parse
 from mo.rules import Spec, TriggerRule, AssertRule
 
 
@@ -66,6 +67,22 @@ def test_assertion_violation_denies():
     assert decision.action == DENY
     assert decision.reason == "assertion_violated"
     assert [v.kind for v in decision.verdicts] == ["CONDEMNED"]
+
+
+def test_deferred_assertion_escalates_instead_of_allowing():
+    # A pre-delivery gate cannot wait out the grace window. It must not ALLOW
+    # an effect that a later tick could condemn, so the pending check goes to a
+    # human; the trial state is not committed.
+    spec = parse(
+        "ASSERT no tool_called where identifier not in tool_declared GRACE 500\n"
+    )
+    gate = Gate(spec)
+    decision = gate.check(ZeusEvent("tool_called", "search", ts=0.0))
+
+    assert decision.action == ESCALATE
+    assert decision.reason == "assertion_pending"
+    assert decision.verdicts == []
+    assert gate.finish() == []
 
 
 def test_denied_effect_never_enters_the_ledger():

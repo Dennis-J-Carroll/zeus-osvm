@@ -1,19 +1,33 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "snapshot.h"
 #include "net.h"
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#ifdef _WIN32
+#include <io.h>
+#define zsnap_fsync _commit
+#else
+#include <unistd.h>
+#define zsnap_fsync fsync
+#endif
 
 /* ------------------------------------------------------------------ */
-/* Format (format version 2)                                           */
+/* Format (format version 3)                                           */
 /*                                                                     */
-/*    8   magic "ZSNAP2\0\0"                                           */
+/*    8   magic "ZSNAP3\0\0"                                           */
 /*   14 x u32  format, code_len, data_len, entry, bc_version, error,   */
 /*             pc, started, running, yielded, pending_kind,            */
 /*             pending_buf, pending_len, packet_count                  */
 /*    5 x i64  sp, csp, pending_fd, pending_id, pending_value          */
+/*    33  lineage (NUL-padded; empty = unbound)                        */
+/*    8   u64  seq (pending effect number; 0 = unbound)                */
+/*    8   u64  journal_head (reserved for the journal chain; 0)        */
 /*    packets  per used slot: index, size, len, proto, src, dst,       */
 /*             payload[size]                                           */
 /*    stack    ZEUS_STACK_SIZE * 8                                     */
@@ -32,14 +46,16 @@
 /* layout does not depend on the compiler's struct padding.            */
 /* ------------------------------------------------------------------ */
 
-#define ZSNAP_FORMAT_VERSION 2u
+#define ZSNAP_FORMAT_VERSION 3u
 #define ZSNAP_HASH_SIZE 8u
 #define ZSNAP_HEADER_U32S 14u
 #define ZSNAP_HEADER_I64S 5u
+#define ZSNAP_META_SIZE (ZEUS_SNAPSHOT_LINEAGE_LEN + 16u)
 #define ZSNAP_MIN_SIZE (sizeof(ZSNAP_MAGIC) + ZSNAP_HEADER_U32S * 4u \
-                        + ZSNAP_HEADER_I64S * 8u + ZSNAP_HASH_SIZE)
+                        + ZSNAP_HEADER_I64S * 8u + ZSNAP_META_SIZE \
+                        + ZSNAP_HASH_SIZE)
 
-static const uint8_t ZSNAP_MAGIC[8] = { 'Z', 'S', 'N', 'A', 'P', '2', 0, 0 };
+static const uint8_t ZSNAP_MAGIC[8] = { 'Z', 'S', 'N', 'A', 'P', '3', 0, 0 };
 
 /* ------------------------------ write side ------------------------- */
 
@@ -101,6 +117,119 @@ static bool packet_slot_ok(const ZeusPacket *pk) {
            pk->len <= pk->size;
 }
 
+static bool is_hex_digit(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+}
+
+static bool snapshot_lineage_ok(const char *lineage) {
+    if (!lineage || !*lineage) return true;
+    if (strlen(lineage) != 32) return false;
+    for (size_t i = 0; i < 32; i++) {
+        if (!is_hex_digit(lineage[i])) return false;
+    }
+    return true;
+}
+
+/* Write the whole file through a same-directory temporary and rename it into
+ * place. The destination either keeps its previous contents or becomes the
+ * complete new snapshot; a crash cannot leave a half-written file under the
+ * name a dossier points at. */
+static bool write_file_atomic(const char *path, const uint8_t *data,
+                              size_t len) {
+    if (!path || !*path) return false;
+
+    const char *slash = strrchr(path, '/');
+#ifdef _WIN32
+    {
+        const char *bslash = strrchr(path, '\\');
+        if (bslash && (!slash || bslash > slash)) slash = bslash;
+    }
+#endif
+
+    char *dir = NULL;
+    const char *base = path;
+    if (!slash) {
+        dir = (char *)malloc(2);
+        if (!dir) return false;
+        memcpy(dir, ".", 2);
+    } else {
+        size_t n = (size_t)(slash - path);
+        if (n == 0) n = 1;          /* the file sits in the root directory */
+        dir = (char *)malloc(n + 1);
+        if (!dir) return false;
+        memcpy(dir, path, n);
+        dir[n] = '\0';
+        base = slash + 1;
+    }
+    if (*base == '\0') {
+        free(dir);
+        return false;
+    }
+
+    size_t need = strlen(dir) + 1 + strlen(base) + sizeof(".tmp.XXXXXX");
+    char *tmp = (char *)malloc(need);
+    if (!tmp) {
+        free(dir);
+        return false;
+    }
+    int written = snprintf(tmp, need, "%s/%s.tmp.XXXXXX", dir, base);
+    if (written < 0 || (size_t)written >= need) {
+        free(tmp);
+        free(dir);
+        return false;
+    }
+
+    int fd = mkstemp(tmp);
+    if (fd < 0) {
+        free(tmp);
+        free(dir);
+        return false;
+    }
+
+    bool ok = true;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, data + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+            break;
+        }
+        if (n == 0) {
+            ok = false;
+            break;
+        }
+        off += (size_t)n;
+    }
+    if (ok && zsnap_fsync(fd) != 0) ok = false;
+    if (close(fd) != 0) ok = false;
+
+    if (ok && rename(tmp, path) != 0) ok = false;
+
+    if (!ok) {
+        unlink(tmp);
+        free(tmp);
+        free(dir);
+        return false;
+    }
+
+#ifndef _WIN32
+    /* Make the directory entry durable too: without this a crash can leave
+     * the old name pointing at the old file after the new inode was synced. */
+    int dfd = open(dir, O_RDONLY);
+    if (dfd >= 0) {
+        int ignored = fsync(dfd);
+        (void)ignored;
+        close(dfd);
+    }
+#endif
+
+    free(tmp);
+    free(dir);
+    return true;
+}
+
 /* The writer and the reader enforce the same invariants, so a snapshot is
  * either a state execution can produce or no file at all. */
 static bool snapshot_state_ok(const ZeusVM *vm) {
@@ -141,8 +270,10 @@ static bool snapshot_state_ok(const ZeusVM *vm) {
     return true;
 }
 
-ZeusError zeus_vm_snapshot(const ZeusVM *vm, const char *path) {
-    if (!vm || !path) return ZEUS_ERR_IO;
+static ZeusError snapshot_write(const ZeusVM *vm, const char *path,
+                                const ZeusSnapshotMeta *meta) {
+    if (!vm || !path || !meta) return ZEUS_ERR_IO;
+    if (!snapshot_lineage_ok(meta->lineage)) return ZEUS_ERR_SNAPSHOT;
     if (!snapshot_state_ok(vm)) return ZEUS_ERR_SNAPSHOT;
 
     uint32_t code_len = vm->program.header.code_len;
@@ -181,6 +312,10 @@ ZeusError zeus_vm_snapshot(const ZeusVM *vm, const char *path) {
     put_i64(&b, vm->pending.id);
     put_i64(&b, vm->pending.value);
 
+    put_bytes(&b, meta->lineage, ZEUS_SNAPSHOT_LINEAGE_LEN);
+    put_i64(&b, (int64_t)meta->seq);
+    put_i64(&b, (int64_t)meta->journal_head);
+
     if (vm->net) {
         for (int i = 0; i < ZEUS_MAX_PACKETS; i++) {
             const ZeusPacket *pk = &vm->net->packets[i];
@@ -213,17 +348,35 @@ ZeusError zeus_vm_snapshot(const ZeusVM *vm, const char *path) {
         return ZEUS_ERR_IO;
     }
 
-    FILE *f = fopen(path, "wb");
-    if (!f) {
-        free(b.p);
-        return ZEUS_ERR_IO;
-    }
-    size_t n = fwrite(b.p, 1, b.len, f);
-    int close_status = fclose(f);
+    bool wrote = write_file_atomic(path, b.p, b.len);
     free(b.p);
+    return wrote ? ZEUS_OK : ZEUS_ERR_IO;
+}
 
-    if (n != b.len || close_status != 0) return ZEUS_ERR_IO;
-    return ZEUS_OK;
+ZeusError zeus_vm_snapshot(const ZeusVM *vm, const char *path) {
+    ZeusSnapshotMeta meta;
+    memset(&meta, 0, sizeof(meta));
+    return snapshot_write(vm, path, &meta);
+}
+
+ZeusError zeus_vm_snapshot_bound_ex(const ZeusVM *vm, const char *path,
+                                    const char *lineage, uint64_t seq,
+                                    uint64_t journal_head) {
+    /* Validate before copying: snprintf would truncate a too-long id into a
+     * different, apparently well-formed lineage. */
+    if (!snapshot_lineage_ok(lineage)) return ZEUS_ERR_SNAPSHOT;
+
+    ZeusSnapshotMeta meta;
+    memset(&meta, 0, sizeof(meta));
+    if (lineage) snprintf(meta.lineage, sizeof(meta.lineage), "%s", lineage);
+    meta.seq = seq;
+    meta.journal_head = journal_head;
+    return snapshot_write(vm, path, &meta);
+}
+
+ZeusError zeus_vm_snapshot_bound(const ZeusVM *vm, const char *path,
+                                 const char *lineage, uint64_t seq) {
+    return zeus_vm_snapshot_bound_ex(vm, path, lineage, seq, 0);
 }
 
 /* ------------------------------ read side -------------------------- */
@@ -283,7 +436,25 @@ static uint8_t *read_whole_file(const char *path, size_t *out_len) {
     return p;
 }
 
-ZeusError zeus_vm_restore(ZeusVM *vm, const char *path) {
+static bool read_lineage(const uint8_t raw[ZEUS_SNAPSHOT_LINEAGE_LEN],
+                         char out[ZEUS_SNAPSHOT_LINEAGE_LEN]) {
+    size_t n = 0;
+    while (n < ZEUS_SNAPSHOT_LINEAGE_LEN && raw[n] != 0) n++;
+    if (n == ZEUS_SNAPSHOT_LINEAGE_LEN) return false;
+    for (size_t i = n; i < ZEUS_SNAPSHOT_LINEAGE_LEN; i++) {
+        if (raw[i] != 0) return false;
+    }
+    if (n != 0 && n != 32) return false;
+    for (size_t i = 0; i < n; i++) {
+        if (!is_hex_digit((char)raw[i])) return false;
+    }
+    memcpy(out, raw, n);
+    out[n] = '\0';
+    return true;
+}
+
+ZeusError zeus_vm_restore_ex(ZeusVM *vm, const char *path,
+                             ZeusSnapshotMeta *out) {
     if (!vm || !path) return ZEUS_ERR_IO;
 
     size_t file_len = 0;
@@ -322,6 +493,9 @@ ZeusError zeus_vm_restore(ZeusVM *vm, const char *path) {
     uint32_t error = 0, pc = 0, started = 0, running = 0, yielded = 0;
     uint32_t pending_kind = 0, pending_buf = 0, pending_len = 0, packet_count = 0;
     int64_t sp = 0, csp = 0, pending_fd = 0, pending_id = 0, pending_value = 0;
+    uint8_t meta_lineage[ZEUS_SNAPSHOT_LINEAGE_LEN];
+    memset(meta_lineage, 0, sizeof(meta_lineage));
+    int64_t meta_seq = 0, meta_head = 0;
 
     bool parsed =
         rd_bytes(&r, magic, sizeof(magic)) &&
@@ -343,13 +517,24 @@ ZeusError zeus_vm_restore(ZeusVM *vm, const char *path) {
         rd_i64(&r, &csp) &&
         rd_i64(&r, &pending_fd) &&
         rd_i64(&r, &pending_id) &&
-        rd_i64(&r, &pending_value);
+        rd_i64(&r, &pending_value) &&
+        rd_bytes(&r, meta_lineage, sizeof(meta_lineage)) &&
+        rd_i64(&r, &meta_seq) &&
+        rd_i64(&r, &meta_head);
+
+    ZeusSnapshotMeta meta;
+    memset(&meta, 0, sizeof(meta));
+    bool meta_ok = parsed && read_lineage(meta_lineage, meta.lineage);
+    if (meta_ok) {
+        meta.seq = (uint64_t)meta_seq;
+        meta.journal_head = (uint64_t)meta_head;
+    }
 
     bool pending_zero = pending_kind == (uint32_t)ZEUS_EFFECT_NONE &&
                         pending_buf == 0 && pending_len == 0 &&
                         pending_fd == 0 && pending_id == 0 && pending_value == 0;
 
-    bool valid = parsed
+    bool valid = parsed && meta_ok
         && memcmp(magic, ZSNAP_MAGIC, sizeof(magic)) == 0
         && format == ZSNAP_FORMAT_VERSION
         && bc_version == ZEUS_VERSION
@@ -465,5 +650,10 @@ ZeusError zeus_vm_restore(ZeusVM *vm, const char *path) {
     free(file);
     zeus_vm_free(vm);   /* release whatever the caller had loaded */
     *vm = tmp;
+    if (out) *out = meta;
     return ZEUS_OK;
+}
+
+ZeusError zeus_vm_restore(ZeusVM *vm, const char *path) {
+    return zeus_vm_restore_ex(vm, path, NULL);
 }

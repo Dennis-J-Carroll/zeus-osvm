@@ -6,8 +6,10 @@ answers one question before delivery: is this effect accounted for by the spec?
     ALLOW     a rule claimed the event (it triggers, fulfils, or is explicitly
               condemned — the last one is DENY, see below)
     DENY      an ASSERT matched; the effect must not happen
-    ESCALATE  nothing claimed it. Silence is not permission (premortem #5):
-              an unmatched effect goes to a human, never through as "fine".
+    ESCALATE  nothing claimed it, or a deferred ASSERT is still inside its
+              grace window. A pre-delivery gate cannot wait for a late
+              declaration, so a human decides; silence is not permission
+              (premortem #5).
 
 Two properties matter more than the decision vocabulary:
 
@@ -47,6 +49,9 @@ class Gate:
 
         if any(v.kind == "CONDEMNED" for v in observation.verdicts):
             return Decision(DENY, "assertion_violated", observation.verdicts)
+
+        if observation.pending_assertion:
+            return Decision(ESCALATE, "assertion_pending", observation.verdicts)
 
         if not observation.matched:
             return Decision(ESCALATE, "unmatched_effect", observation.verdicts)

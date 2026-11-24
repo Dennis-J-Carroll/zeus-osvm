@@ -1,0 +1,7 @@
+; Dense report demo: many millisecond calls beside a six-second BOLT.
+; Linear time collapsed the fast calls into a sliver; the report now places
+; every verdict in an even lane and keeps the true duration in its tooltip.
+
+on tool_called as $tool:
+    EXPECT tool_result for $tool
+    WINDOW 5000

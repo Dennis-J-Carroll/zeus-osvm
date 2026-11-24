@@ -31,6 +31,10 @@ on tool_declared as $tool:
 ASSERT no tool_called where identifier not in tool_declared
 '''
 
+GRACE_SPEC_SRC = '''\
+ASSERT no tool_called where identifier not in tool_declared GRACE 500
+'''
+
 
 def test_load_spec_imports_module_level_spec(tmp_path):
     spec = load_spec(str(_write_spec(tmp_path)))
@@ -58,6 +62,69 @@ def test_eval_with_zspec_runs_end_to_end(tmp_path, capsys):
 
     assert code == 1
     assert '"kind": "BOLTED"' in out
+
+
+def test_eval_grace_window_tolerates_late_declaration(tmp_path, capsys):
+    spec = tmp_path / "grace.zspec"
+    spec.write_text(GRACE_SPEC_SRC)
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        '{"primitive":"tool_called","identifier":"search","ts":0.0}\n'
+        '{"primitive":"tool_declared","identifier":"search","ts":200.0}\n'
+    )
+
+    code = main(["eval", str(spec), str(trace)])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "CONDEMNED" not in out
+
+
+def test_eval_grace_window_condemns_after_window(tmp_path, capsys):
+    spec = tmp_path / "grace.zspec"
+    spec.write_text(GRACE_SPEC_SRC)
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        '{"primitive":"tool_called","identifier":"search","ts":0.0}\n'
+        '{"primitive":"tool_declared","identifier":"search","ts":800.0}\n'
+    )
+
+    code = main(["eval", str(spec), str(trace)])
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert '"kind": "CONDEMNED"' in out
+    assert "late_declaration_grace_expired" in out
+
+
+def test_watch_grace_window_tolerates_wire_order_declaration(tmp_path):
+    # The live projector emits the declaration when the tools/list response
+    # crosses the wire. This call is before it, but the declaration lands
+    # inside the 500ms grace window, so live mode must not condemn it.
+    spec = tmp_path / "grace.zspec"
+    spec.write_text(GRACE_SPEC_SRC)
+    session = tmp_path / "s.jsonl"
+    session.write_text(
+        json.dumps({
+            "dir": "c2s", "seq": 1,
+            "frame": {"id": 1, "method": "tools/call",
+                      "params": {"name": "search", "arguments": {}}},
+        }) + "\n" +
+        json.dumps({
+            "dir": "s2c", "seq": 2,
+            "frame": {"id": 2, "result": {"tools": [{"name": "search"}]}},
+        }) + "\n"
+    )
+
+    clocks = iter([0.0, 0.0, 0.0, 1000.0])
+    result = watch(
+        load_spec(str(spec)), str(session),
+        tick_ms=100, idle_ms=100,
+        clock=lambda: next(clocks, 1000.0),
+        sleep=lambda *_: None, out=io.StringIO(),
+    )
+
+    assert result.verdicts == []
 
 
 def test_eval_mcp_flag_routes_session_through_adapter(capsys):
@@ -113,6 +180,65 @@ def test_watch_bolts_a_silent_unanswered_call_mid_session(tmp_path):
     # the verdict was streamed to stdout the moment it fired
     printed = [json.loads(l) for l in out.getvalue().splitlines() if l.strip()]
     assert printed and printed[0]["kind"] == "BOLTED"
+
+
+def test_watch_default_tick_tightens_for_a_short_window(tmp_path):
+    # the §8 decision: a 50ms window must not wait on a fixed 100ms tick. With
+    # no tick_ms argument, watch derives ~5ms ticks (and a 2.5ms poll) from the
+    # spec, so the BOLT lands within 10% of the window after it lapses.
+    spec_path = tmp_path / "short.zspec"
+    spec_path.write_text(
+        "on tool_called as $t:\n"
+        "    EXPECT tool_result for $t\n"
+        "    WINDOW 50\n"
+    )
+    session = tmp_path / "s.jsonl"
+    session.write_text(json.dumps({
+        "dir": "c2s", "seq": 1,
+        "frame": {"id": 5, "method": "tools/call",
+                  "params": {"name": "search", "arguments": {}}},
+    }) + "\n")
+
+    class Clock:
+        def __init__(self, step_ms):
+            self.t = 0.0
+            self.step = step_ms
+
+        def __call__(self):
+            now = self.t
+            self.t += self.step
+            return now
+
+    clock = Clock(2.5)
+    result = watch(
+        load_spec(str(spec_path)), str(session),
+        clock=clock, sleep=lambda *_: None,
+        stop=lambda: clock.t > 300.0, out=io.StringIO(),
+    )
+
+    bolts = [v for v in result.verdicts if v.kind == "BOLTED"]
+    assert len(bolts) == 1
+    assert bolts[0].detail["reason"] == "liveness_window_expired"
+    assert bolts[0].detail["lapsed_at"] == bolts[0].opened_at + 50.0
+    assert 0 < bolts[0].detail["notice_lag_ms"] <= 10.0
+
+
+def test_watch_cli_accepts_a_tick_ms_override(tmp_path, capsys):
+    spec = tmp_path / "live.zspec"
+    spec.write_text(
+        "on tool_declared as $t:\n"
+        "    EXPECT tool_called for $t\n"
+        "    WINDOW 5000\n"
+    )
+    session = tmp_path / "s.jsonl"
+    session.write_text("")
+
+    code = main([
+        "watch", "--tick-ms", "25", "--idle-ms", "0",
+        str(spec), str(session),
+    ])
+
+    assert code == 0
 
 
 def test_report_writes_self_contained_html(tmp_path):
@@ -209,3 +335,26 @@ def test_report_prints_zspec_parse_error_cleanly(tmp_path, capsys):
     assert code == 2
     assert "mo:" in err
     assert "line" in err.lower()
+
+
+def test_eval_reports_the_fragment_file_for_an_included_rule(tmp_path, capsys):
+    (tmp_path / "frag.zspec").write_text(
+        "on tool_declared as $t:\n"
+        "    EXPECT tool_called for $t\n"
+        "    WINDOW 5000\n"
+    )
+    root = tmp_path / "root.zspec"
+    root.write_text("INCLUDE frag.zspec\n")
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        '{"primitive":"tool_declared","identifier":"search","ts":0.0}\n'
+    )
+
+    code = main(["eval", str(root), str(trace)])
+    out = capsys.readouterr().out
+    verdicts = [json.loads(line) for line in out.splitlines() if line.strip()]
+
+    assert code == 1
+    bolt = verdicts[0]
+    assert bolt["spec_source"].endswith("frag.zspec")
+    assert bolt["spec_line"] == 1

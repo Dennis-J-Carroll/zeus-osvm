@@ -1,4 +1,5 @@
 from mo.events import ZeusEvent
+from mo.parser import parse
 from mo.rules import Spec, TriggerRule, AssertRule
 from mo.engine import run, iter_verdicts
 
@@ -44,9 +45,12 @@ def test_window_expiry_bolts_on_later_event():
     assert _kinds(result) == ["BOLTED"]
     v = result.verdicts[0]
     assert v.identifier == "search"
-    assert v.closed_at == 6000.0
+    assert v.closed_at == 6000.0          # notice-time is preserved
     assert v.detail["reason"] == "liveness_window_expired"
     assert v.detail["window_ms"] == 5000
+    # the exact lapse instant is the window boundary, not the late notice
+    assert v.detail["lapsed_at"] == 5000.0
+    assert v.detail["notice_lag_ms"] == 1000.0
 
 
 def test_open_obligation_at_end_of_stream_bolts():
@@ -61,6 +65,9 @@ def test_open_obligation_at_end_of_stream_bolts():
 
     assert _kinds(result) == ["BOLTED"]
     assert result.verdicts[0].detail["reason"] == "session_ended_unresolved"
+    # the window had not expired when the session ended, so there is no
+    # lapse instant to report (only a lapsed window carries lapsed_at)
+    assert "lapsed_at" not in result.verdicts[0].detail
 
 
 def test_assert_violation_condemns():
@@ -82,6 +89,92 @@ def test_assert_violation_condemns():
     assert v.identifier == "rm_rf"
     assert v.spec_line == 3
     assert v.closed_at == 10.0
+
+
+def _grace_spec():
+    return parse(
+        "ASSERT no tool_called where identifier not in tool_declared GRACE 500\n"
+    )
+
+
+def test_grace_tolerates_declaration_within_window():
+    spec = _grace_spec()
+    stream = [
+        ZeusEvent("tool_called", "search", ts=0.0),
+        ZeusEvent("tool_declared", "search", ts=200.0),
+    ]
+
+    result = run(stream, spec)
+
+    assert result.verdicts == []
+    assert result.total_events == 2
+
+
+def test_grace_tick_after_deadline_condemns_mid_silence():
+    spec = _grace_spec()
+    stream = [
+        ZeusEvent("tool_called", "search", ts=0.0),
+        ZeusEvent("tick", None, ts=600.0),
+    ]
+
+    result = run(stream, spec)
+
+    assert _kinds(result) == ["CONDEMNED"]
+    v = result.verdicts[0]
+    assert v.identifier == "search"
+    assert v.spec_line == 1
+    assert v.closed_at == 600.0
+    assert v.detail["call_ts"] == 0.0
+    assert v.detail["grace_ms"] == 500
+    assert v.detail["reason"] == "late_declaration_grace_expired"
+
+
+def test_grace_late_declaration_event_condemns_before_absolving():
+    spec = _grace_spec()
+    stream = [
+        ZeusEvent("tool_called", "search", ts=0.0),
+        ZeusEvent("tool_declared", "search", ts=800.0),
+    ]
+
+    result = run(stream, spec)
+
+    assert _kinds(result) == ["CONDEMNED"]
+    assert result.verdicts[0].closed_at == 800.0
+    assert result.verdicts[0].detail["reason"] == "late_declaration_grace_expired"
+
+
+def test_grace_is_inclusive_at_the_deadline():
+    spec = _grace_spec()
+    stream = [
+        ZeusEvent("tool_called", "search", ts=0.0),
+        ZeusEvent("tool_declared", "search", ts=500.0),
+    ]
+
+    result = run(stream, spec)
+
+    assert result.verdicts == []
+
+
+def test_grace_pending_condemns_at_end_of_stream():
+    spec = _grace_spec()
+    result = run([ZeusEvent("tool_called", "search", ts=10.0)], spec)
+
+    assert _kinds(result) == ["CONDEMNED"]
+    v = result.verdicts[0]
+    assert v.closed_at == 10.0
+    assert v.detail["reason"] == "session_ended_undeclared"
+
+
+def test_grace_declaration_before_call_does_not_open_pending():
+    spec = _grace_spec()
+    stream = [
+        ZeusEvent("tool_declared", "search", ts=0.0),
+        ZeusEvent("tool_called", "search", ts=100.0),
+    ]
+
+    result = run(stream, spec)
+
+    assert result.verdicts == []
 
 
 def test_replay_is_deterministic():
@@ -166,6 +259,8 @@ def test_tick_expires_a_silent_obligation():
     assert v.identifier == "search"
     assert v.closed_at == 5001.0
     assert v.detail["reason"] == "liveness_window_expired"
+    assert v.detail["lapsed_at"] == 5000.0
+    assert v.detail["notice_lag_ms"] == 1.0
 
 
 def test_tick_before_deadline_does_not_bolt():
@@ -184,6 +279,9 @@ def test_tick_before_deadline_does_not_bolt():
 
     assert _kinds(result) == ["BOLTED"]
     assert result.verdicts[0].detail["reason"] == "session_ended_unresolved"
+    # the window had not expired when the session ended, so there is no
+    # lapse instant to report (only a lapsed window carries lapsed_at)
+    assert "lapsed_at" not in result.verdicts[0].detail
 
 
 def test_ticks_do_not_count_against_coverage():
@@ -270,3 +368,41 @@ def test_correlation_absent_falls_back_to_identifier_match():
     bolted = [v for v in result.verdicts if v.kind == "BOLTED"]
     assert len(fulfilled) == 1
     assert len(bolted) == 1
+
+
+def test_uncorrelated_declaration_obligation_accepts_correlated_call():
+    # A declaration has no instance id; the execution honoring it does. Only
+    # the obligation's own correlation can constrain matching, so the absent
+    # side must not veto its execution (canonical every_tool_honored spec).
+    spec = Spec(triggers=[
+        TriggerRule(on_primitive="tool_declared", expects="tool_called",
+                    window_ms=5000, spec_line=1),
+    ])
+    stream = [
+        ZeusEvent("tool_declared", "search", ts=0.0),
+        ZeusEvent("tool_called", "search", ts=10.0, correlation="3"),
+    ]
+
+    result = run(stream, spec)
+
+    assert _kinds(result) == ["FULFILLED"]
+    assert result.verdicts[0].identifier == "search"
+    assert result.verdicts[0].closed_at == 10.0
+
+
+def test_correlated_obligation_rejects_unattributable_result():
+    # The other direction stays strict: a correlated call can only be closed
+    # by an event carrying the same instance id, not a bare identifier match.
+    spec = Spec(triggers=[
+        TriggerRule(on_primitive="tool_called", expects="tool_result",
+                    window_ms=5000, spec_line=1),
+    ])
+    stream = [
+        ZeusEvent("tool_called", "search", correlation="a", ts=0.0),
+        ZeusEvent("tool_result", "search", ts=20.0),
+    ]
+
+    result = run(stream, spec)
+
+    assert _kinds(result) == ["BOLTED"]
+    assert result.verdicts[0].detail.get("correlation") == "a"

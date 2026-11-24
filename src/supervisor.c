@@ -2,9 +2,11 @@
 
 #include "supervisor.h"
 #include "snapshot.h"
+#include "journal.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,7 +62,7 @@ static void make_id(char out[ZEUS_ID_LEN]) {
     out[32] = '\0';
 }
 
-static bool valid_id(const char *s) {
+bool zeus_valid_id(const char *s) {
     if (!s || strlen(s) != 32) return false;
     for (int i = 0; i < 32; i++) {
         char c = s[i];
@@ -102,12 +104,19 @@ static bool journal_write(ZeusSupervisor *s, const char *line) {
      * like an outcome for the effect and let the next open replay it. An
      * ambiguous journal stays ambiguous until an operator resolves it. */
     if (s->ambiguous) return false;
-    if (fputs(line, s->journal) == EOF) return false;
-    if (fputc('\n', s->journal) == EOF) return false;
-    if (fflush(s->journal) != 0) return false;
-    /* Durability is the point of the intent record: flush to the device
-     * before the effect is allowed to reach the host. */
-    if (fsync(fileno(s->journal)) != 0) return false;
+
+    int fd = fileno(s->journal);
+    if (fd < 0) return false;
+
+    /* Every record names the hash of the previous one. Prepending it here keeps
+     * each writer honest and gives the whole file one chain. */
+    char buf[ZEUS_JOURNAL_LINE_MAX];
+    int n = snprintf(buf, sizeof(buf), "{\"prev\":\"%016llx\",%s",
+                     (unsigned long long)s->head_hash, line + 1);
+    if (n < 0 || (size_t)n >= sizeof(buf)) return false;
+    if (!zeus_journal_append_fd(fd, buf, (size_t)n)) return false;
+
+    s->head_hash = zeus_journal_hash(buf, (size_t)n);
     return true;
 }
 
@@ -162,13 +171,16 @@ static bool journal_park(ZeusSupervisor *s, uint64_t pending_seq,
 
 static bool journal_deny(ZeusSupervisor *s, uint64_t seq, const ZeusEffect *e,
                          uint64_t digest, const char *reason) {
+    char escaped[512];
+    if (!zeus_json_escape(reason, escaped, sizeof(escaped))) return false;
+
     char line[1024];
     snprintf(line, sizeof(line),
              "{\"seq\":%llu,\"event\":\"deny\",\"machine\":\"%s\","
              "\"lineage\":\"%s\",\"effect\":\"%s\",\"digest\":\"0x%016llx\","
              "\"reason\":\"%s\"}",
              (unsigned long long)seq, s->machine_id, s->lineage_id,
-             zeus_effect_name(e->kind), (unsigned long long)digest, reason);
+             zeus_effect_name(e->kind), (unsigned long long)digest, escaped);
     return journal_write(s, line);
 }
 
@@ -185,14 +197,20 @@ static bool journal_halt(ZeusSupervisor *s, const ZeusVM *vm, const char *reason
 /* Refuse the pending effect: journal the refusal at `seq`, spend the number
  * and kill the machine at the seam. Spending it matters: a denial is an
  * outcome for that slot, so a later approval naming the same seq must not be
- * able to deliver an effect the journal already records as refused. */
+ * able to deliver an effect the journal already records as refused.
+ *
+ * The cancellation happens whether or not the append succeeded: an effect must
+ * never reach the host after its refusal failed to become durable. Only a
+ * recorded refusal spends the number, because the counter must agree with what
+ * the journal can prove; an unrecorded one leaves the journal's last committed
+ * seq untouched and says so through the return value. */
 static bool deny_effect(ZeusSupervisor *s, ZeusVM *vm, uint64_t seq,
                         const ZeusEffect *eff, uint64_t digest,
                         const char *reason) {
-    if (!journal_deny(s, seq, eff, digest, reason)) return false;
-    s->seq = seq;
+    bool journaled = journal_deny(s, seq, eff, digest, reason);
+    if (journaled) s->seq = seq;
     zeus_vm_cancel_effect(vm, ZEUS_ERR_EFFECT);
-    return true;
+    return journaled;
 }
 
 static bool parse_u64_span(const char *s, uint64_t *out, const char **endp) {
@@ -214,49 +232,6 @@ static bool parse_u64(const char *s, uint64_t *out) {
     return end != NULL && *end == '\0';
 }
 
-/* Read the last committed effect number for `lineage`, and whether the
- * journal ends in an intent that never got a commit. */
-static void scan_journal(const char *path, const char *lineage,
-                         uint64_t *max_seq, bool *ambiguous,
-                         uint64_t *ambiguous_seq) {
-    *max_seq = 0;
-    *ambiguous = false;
-    *ambiguous_seq = 0;
-
-    FILE *f = fopen(path, "r");
-    if (!f) return;
-
-    char needle[64];
-    snprintf(needle, sizeof(needle), "\"lineage\":\"%s\"", lineage);
-
-    char line[2048];
-    bool open_intent = false;
-    uint64_t pending_seq = 0;
-
-    while (fgets(line, sizeof(line), f)) {
-        if (!strstr(line, needle)) continue;
-
-        const char *sp = strstr(line, "\"seq\":");
-        uint64_t seq = 0;
-        if (!sp || !parse_u64_span(sp + 6, &seq, NULL)) continue;
-        if (seq > *max_seq) *max_seq = seq;
-
-        if (strstr(line, "\"event\":\"intent\"")) {
-            open_intent = true;
-            pending_seq = seq;
-        } else if (strstr(line, "\"event\":\"start\"")) {
-            /* A start record says a process opened the journal; it is not an
-             * outcome for the effect. Older builds appended one after an
-             * unmatched intent, which erased it, so look through them. */
-        } else {
-            open_intent = false;
-        }
-    }
-    fclose(f);
-
-    *ambiguous = open_intent;
-    *ambiguous_seq = pending_seq;
-}
 
 /* ------------------------------------------------------------------ */
 /* Digest                                                              */
@@ -423,7 +398,7 @@ bool zeus_dossier_load(const char *path, ZeusDossier *out) {
     memset(out, 0, sizeof(*out));
     if (!format || strcmp(format, "1") != 0) return false;
     if (!kind || strcmp(kind, "dossier") != 0) return false;
-    if (!lineage || !valid_id(lineage)) return false;
+    if (!lineage || !zeus_valid_id(lineage)) return false;
     if (!seq || !parse_u64(seq, &out->seq)) return false;
     if (!digest || !parse_digest(digest, &out->digest)) return false;
 
@@ -450,11 +425,36 @@ bool zeus_approval_load(const char *path, ZeusApproval *out) {
     memset(out, 0, sizeof(*out));
     if (!format || strcmp(format, "1") != 0) return false;
     if (!kind || strcmp(kind, "approval") != 0) return false;
-    if (!lineage || !valid_id(lineage)) return false;
+    if (!lineage || !zeus_valid_id(lineage)) return false;
     if (!seq || !parse_u64(seq, &out->seq)) return false;
     if (!digest || !parse_digest(digest, &out->digest)) return false;
 
     copy_field(out->lineage, sizeof(out->lineage), lineage);
+    return true;
+}
+
+bool zeus_snapshot_matches_dossier(const ZeusSnapshotMeta *m,
+                                   const ZeusDossier *d,
+                                   char *why, size_t why_len) {
+    if (!m || !d) return false;
+
+    /* An empty lineage means the snapshot is unbound. It cannot name an audit
+     * chain, so it is refused below by the sequence check, which no dossier
+     * can satisfy with seq 0. */
+    if (m->lineage[0] != '\0' && strcmp(m->lineage, d->lineage) != 0) {
+        set_why(why, why_len,
+                "snapshot belongs to lineage %s but the dossier says %s; "
+                "refusing to pair a machine with a different audit chain",
+                m->lineage, d->lineage);
+        return false;
+    }
+    if (m->seq != d->seq) {
+        set_why(why, why_len,
+                "snapshot was parked at seq %llu but the dossier says %llu; "
+                "the journal was reset or replaced",
+                (unsigned long long)m->seq, (unsigned long long)d->seq);
+        return false;
+    }
     return true;
 }
 
@@ -497,7 +497,7 @@ bool zeus_supervisor_open(ZeusSupervisor *s, const ZeusPolicy *policy,
     if (policy) s->policy = *policy;
 
     if (lineage && *lineage) {
-        if (!valid_id(lineage)) return false;
+        if (!zeus_valid_id(lineage)) return false;
         snprintf(s->lineage_id, sizeof(s->lineage_id), "%s", lineage);
     }
 
@@ -517,8 +517,24 @@ bool zeus_supervisor_open(ZeusSupervisor *s, const ZeusPolicy *policy,
         return false;
     }
 
-    scan_journal(journal_path, s->lineage_id, &s->seq, &s->ambiguous,
-                 &s->ambiguous_seq);
+    ZeusJournalScan sc;
+    char why[256];
+    if (!zeus_journal_scan(journal_path, s->lineage_id, &sc,
+                           why, sizeof(why))) {
+        snprintf(s->journal_error, sizeof(s->journal_error), "%s", why);
+        close(fd);
+        return false;
+    }
+    s->seq = sc.max_seq;
+    s->ambiguous = sc.ambiguous;
+    s->ambiguous_seq = sc.ambiguous_seq;
+    s->head_hash = sc.head_hash;
+    s->chain_unverified = sc.chain_unverified;
+    if (sc.chain_unverified) {
+        fprintf(stderr,
+                "warning: journal '%s' has legacy records without prev; "
+                "chain unverified\n", journal_path);
+    }
 
     s->journal = fdopen(fd, "a");
     if (!s->journal) {
@@ -655,8 +671,10 @@ ZeusDriveResult zeus_supervisor_drive(ZeusSupervisor *s, ZeusVM *vm,
             if (zeus_policy_check(&s->policy, &eff) != ZEUS_POLICY_ALLOW) {
                 const char *reason = zeus_policy_reason(&s->policy, &eff);
                 if (!deny_effect(s, vm, seq, &eff, digest, reason)) {
-                    set_why(why, why_len, "journal write failed");
-                    return ZEUS_DRIVE_FAILED;
+                    set_why(why, why_len,
+                            "policy denied %s (%s) but the denial could not be "
+                            "journaled", zeus_effect_name(eff.kind), reason);
+                    return ZEUS_DRIVE_DENY_UNRECORDED;
                 }
                 set_why(why, why_len, "policy denied %s (%s)",
                         zeus_effect_name(eff.kind), reason);
@@ -668,8 +686,12 @@ ZeusDriveResult zeus_supervisor_drive(ZeusSupervisor *s, ZeusVM *vm,
                     if (!zeus_approval_binds(&s->approval, s, vm, &eff)) {
                         if (!deny_effect(s, vm, seq, &eff, digest,
                                          "approval_mismatch")) {
-                            set_why(why, why_len, "journal write failed");
-                            return ZEUS_DRIVE_FAILED;
+                            set_why(why, why_len,
+                                    "approval does not match %s seq %llu but "
+                                    "the denial could not be journaled",
+                                    zeus_effect_name(eff.kind),
+                                    (unsigned long long)seq);
+                            return ZEUS_DRIVE_DENY_UNRECORDED;
                         }
                         set_why(why, why_len,
                                 "approval does not match %s seq %llu digest 0x%016llx",
@@ -689,7 +711,20 @@ ZeusDriveResult zeus_supervisor_drive(ZeusSupervisor *s, ZeusVM *vm,
                                 "approval required but no snapshot/dossier path was set");
                         return ZEUS_DRIVE_FAILED;
                     }
-                    if (zeus_vm_snapshot(vm, s->snapshot_path) != ZEUS_OK) {
+                    /* The parked file carries the audit identity it belongs
+                     * to, so a dossier cannot later be paired with a
+                     * different machine or a snapshot from another chain. */
+                    /* The park record comes first so the snapshot can name
+                     * the journal head it was parked at. Restore accepts a
+                     * snapshot whose head is in the chain, which keeps later
+                     * resolve records from invalidating a parked machine. */
+                    if (!journal_park(s, seq, &eff, digest)) {
+                        set_why(why, why_len, "journal write failed");
+                        return ZEUS_DRIVE_FAILED;
+                    }
+                    if (zeus_vm_snapshot_bound_ex(vm, s->snapshot_path,
+                                                  s->lineage_id, seq,
+                                                  s->head_hash) != ZEUS_OK) {
                         set_why(why, why_len, "cannot write snapshot '%s'",
                                 s->snapshot_path);
                         return ZEUS_DRIVE_FAILED;
@@ -698,10 +733,6 @@ ZeusDriveResult zeus_supervisor_drive(ZeusSupervisor *s, ZeusVM *vm,
                                                        s->dossier_path)) {
                         set_why(why, why_len, "cannot write dossier '%s'",
                                 s->dossier_path);
-                        return ZEUS_DRIVE_FAILED;
-                    }
-                    if (!journal_park(s, seq, &eff, digest)) {
-                        set_why(why, why_len, "journal write failed");
                         return ZEUS_DRIVE_FAILED;
                     }
                     set_why(why, why_len,

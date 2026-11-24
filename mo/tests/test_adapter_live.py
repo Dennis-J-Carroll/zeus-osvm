@@ -71,7 +71,60 @@ def test_tail_terminates_after_idle_timeout(tmp_path):
         clock=lambda: next(clocks, 999.0), sleep=lambda *_: None,
     ))
 
-    assert [e.primitive for e in evs] == ["tool_called", "tick"]
+    #...plus the final tick at the idle cutoff (350), so a window that lapsed
+    # during the last quiet interval is reported as a lapse, not a session end.
+    assert [e.primitive for e in evs] == ["tool_called", "tick", "tick"]
+    assert evs[-1].ts == 350.0
+
+
+def test_idle_return_emits_a_final_tick_even_before_the_next_tick_is_due(tmp_path):
+    # tick_ms=1000 does not come due before the 60ms idle cutoff; without the
+    # final tick a window that lapsed at 51ms would be reported as
+    # session_ended_unresolved instead of liveness_window_expired.
+    from mo.adapters.live import tail_events
+
+    p = tmp_path / "s.jsonl"
+    p.write_text("")
+
+    clocks = iter([0.0, 50.0, 100.0])
+    evs = list(tail_events(
+        str(p), project=lambda rec: iter(()), tick_ms=1000, idle_ms=60,
+        clock=lambda: next(clocks, 100.0), sleep=lambda *_: None,
+    ))
+
+    assert [e.primitive for e in evs] == ["tick"]
+    assert evs[0].ts == 100.0
+
+
+def _window_spec(ms):
+    from mo.rules import Spec, TriggerRule
+    return Spec(triggers=[
+        TriggerRule("tool_called", "tool_result", window_ms=ms, spec_line=1),
+    ])
+
+
+def test_auto_tick_is_capped_at_100ms_and_tightens_with_the_window():
+    from mo.adapters.live import auto_tick_ms
+
+    assert auto_tick_ms(_window_spec(5000)) == 100.0
+    assert auto_tick_ms(_window_spec(1000)) == 100.0
+    assert auto_tick_ms(_window_spec(500)) == 50.0
+    assert auto_tick_ms(_window_spec(100)) == 10.0
+    assert auto_tick_ms(_window_spec(50)) == 5.0
+
+
+def test_auto_tick_floors_at_5ms_for_sub_50ms_windows():
+    from mo.adapters.live import auto_tick_ms
+
+    assert auto_tick_ms(_window_spec(10)) == 5.0
+
+
+def test_auto_poll_is_half_the_tick_capped_at_50ms():
+    from mo.adapters.live import auto_poll_s
+
+    assert auto_poll_s(100.0) == 0.05
+    assert auto_poll_s(50.0) == 0.025
+    assert auto_poll_s(5.0) == 0.0025
 
 
 def test_live_tailer_is_protocol_agnostic():

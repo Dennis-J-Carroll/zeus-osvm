@@ -42,7 +42,8 @@ From the repo root (`/home/dennisjcarroll/Desktop/cc_zone/zeus`):
 
 ```bash
 make            # builds zeus, zasm, zdis
-make test       # unit tests (4/4 + 3/3 + 12/12 + 6/6)
+make test       # 4/4 + 3/3 + 12/12 + 14/14 + 19/19 units, then the
+                # 66-check approval, 23-check deny and 20-check journal proofs
 make check      # same suite under ASan + UBSan, then a normal rebuild
 make smoke      # full end-to-end check against every example
 make clean      # remove binaries, *.o, examples/*.zeus, zasm/zdis wrappers
@@ -78,6 +79,10 @@ zeus dis     <file.zeus>               # disassemble bytecode -> instructions
 zeus run-asm <in.zasm> [options]       # assemble in memory and run immediately
 zeus approve <dossier> [--out F]       # approve the exact pending effect
 zeus deny    <dossier> [--journal F]   # kill a machine at its pending effect
+zeus journal verify  <file> [--lineage ID] [--allow-legacy]
+                                       # walk the audit hash chain
+zeus journal resolve --journal F --seq N --outcome committed|aborted --reason TEXT
+                                       # close an open intent under the lock
 zeus jail    [--check] -- <cmd> [args] # namespaces + uid drop + seccomp
 ```
 
@@ -94,6 +99,7 @@ Options for `run`, `restore` and `run-asm`:
 | `--ask`         | Park before sensitive effects and write a dossier                 |
 | `--approve F`   | Approval file checked against the pending effect; implies `--ask`  |
 | `--allow-raw`   | Allow `RAW_*` effects (default: denied)                           |
+| `--allow-gap`   | Act when the journal and a dossier disagree on `seq`             |
 | `--lineage ID`  | Continue an existing audit lineage                                |
 
 ### 3.1 Suspend and resume
@@ -123,6 +129,14 @@ Restoring the same snapshot twice yields two independent machines that can be
 stepped differently — that is the fork primitive. Snapshots are versioned and
 checksummed, so a truncated or edited file is rejected instead of resumed.
 
+Format 3 also records the audit lineage and pending effect number a parked
+machine belongs to; `zeus approve` and `zeus deny` refuse a dossier whose
+lineage or sequence disagrees with the snapshot (exit 4), because the digest
+would otherwise describe a different machine. Saves are atomic: the bytes go
+to a same-directory temporary, are fsynced, renamed over the destination and
+the directory is fsynced, so a failed save leaves the previous file
+byte-identical rather than half-replaced.
+
 `zeus_vm_restore` requires a `zeus_vm_init`-ed machine and is atomic: the file
 is validated into a temporary machine first, so a failed restore leaves the
 destination exactly as it was. The writer is equally strict — it refuses to
@@ -147,6 +161,13 @@ halted with `ZEUS_ERR_EFFECT`, the denial is journaled, and `zeus` exits 4.
 Policy lives in the process, not in the snapshot — restoring a file cannot
 loosen it.
 
+A denial that cannot be appended to the journal (a full or read-only file) is
+still enforced: the effect is cancelled and the machine halted, because an
+effect must never reach the host after its refusal failed to become durable.
+But `zeus` reports that as an error (exit 1), not as a recorded denial, and the
+counter keeps the journal's last committed number instead of inventing an
+outcome the audit trail cannot prove.
+
 ### 3.3 The audit journal
 
 `--journal F` writes JSONL and opens `F` for **append**; an existing journal is
@@ -157,8 +178,8 @@ Every delivered effect produces an `intent` record, flushed and fsynced before
 the effect reaches the host, then a `commit`:
 
 ```json
-{"seq":1,"event":"intent","machine":"…","lineage":"…","effect":"send","fd":3,"buf":1024,"len":16,"digest":"0x…"}
-{"seq":1,"event":"commit","machine":"…","lineage":"…","result":16,"error":0}
+{"prev":"…","seq":1,"event":"intent","machine":"…","lineage":"…","effect":"send","fd":3,"buf":1024,"len":16,"digest":"0x…"}
+{"prev":"…","seq":1,"event":"commit","machine":"…","lineage":"…","result":16,"error":0}
 ```
 
 `seq` and `lineage` belong to the supervisor. A restored machine resumes
@@ -170,6 +191,52 @@ prevent. A refused open writes nothing, so the unmatched intent stays the last
 record and every retry keeps refusing instead of erasing the evidence. `start`
 records are transparent to the scan, so a journal damaged by an older build
 (an intent followed by a `start`) is still recognised as ambiguous.
+
+Every record written by this build begins with `"prev":"<16 hex>"`, the
+FNV-1a hash of the previous record's bytes (0 for the first record). The
+supervisor tracks the head of that chain and writes it into a parked snapshot,
+so a machine can only be resumed against the journal it was parked in. Older
+journals without `prev` still load, but the chain cannot be verified: opening
+one prints a single warning that the chain is unverified.
+
+Records are parsed strictly at record scope: a key is only matched at the top
+level of the JSON object, strings are unescaped, and ids must be the same
+32-hex values everywhere else. A malformed record, a line longer than 4096
+bytes, a truncated final record, a broken `prev` chain, or a duplicate or
+regressed sequence is a hard error with the offending line number — never a
+record silently skipped.
+
+```bash
+./zeus journal verify audit.jsonl                 # 0 clean, 1 broken
+./zeus journal verify audit.jsonl --lineage ID    # sequence checks for one chain
+./zeus journal verify old.jsonl --allow-legacy    # accept a chain without prev
+```
+
+`journal verify` walks the hash chain and the per-lineage sequence accounting,
+prints the first divergent line and what broke, and exits 1 on a break. A
+legacy journal is refused unless `--allow-legacy` is given; with it, verify
+exits 0 but still reports the chain as unverified.
+
+A crash between `intent` and `commit` leaves an ambiguous journal. The
+sanctioned repair is a resolve record, not hand-editing the file:
+
+```bash
+./zeus journal resolve --journal audit.jsonl --seq 7 \
+    --outcome aborted --reason "worker died before the effect"
+```
+
+`journal resolve` takes the same exclusive lock as a supervisor, appends a
+`resolve` record chained to the last one, and spends the sequence, so the next
+run continues at `seq + 1`. It refuses when there is no open intent at that
+number or when it was already resolved. `--outcome committed` records that the
+effect did reach the host; `aborted` records that it did not. Both remain
+visible in the trail alongside the intent.
+
+An append is a single `write(2)`. If it is short or fails (a file-size limit, a
+full disk, a failed `fsync`), the journal is truncated back to the last complete
+record before the failure is reported: a half-written record is worse than
+none, because a later scan could read an event or a `seq` out of a fragment the
+refusal said was never recorded.
 
 ### 3.4 Approval: park, approve, resume, deny
 
@@ -193,6 +260,25 @@ refuses to approve it (exit 4) if the pending effect's digest is different.
 One approval authorises one effect, and `--approve` implies the gate even if `--ask` is omitted: the
 approval covers the first sensitive effect and the ones after it park for their
 own.
+
+The snapshot's own `(lineage, seq)` binding is checked before the digest: a
+dossier naming a different audit chain or a different parked sequence is
+refused with exit 4, because its digest would answer a question about the wrong
+machine. If the journal's next sequence number does not match a dossier, `zeus`
+refuses with exit 1 instead of acting across the gap: the decision belongs to
+a different point in the audit trail. `--allow-gap` is the explicit override
+for that dossier gap; it warns and proceeds, leaving the mismatch visible in
+the run rather than hiding it. A supplied approval is not gap-overridable: it
+is verified against the pending effect, so a spent or stale approval is a
+denial (exit 4), because it cannot authorise a different sequence.
+
+A parked snapshot also records the journal head it was written at. Restoring
+it against a different journal is refused with exit 1: the machine's park
+record is not in that chain, so the effect was never journaled there. Later
+records in the same journal (a `resolve`, another `start`) do not invalidate
+the snapshot, because the recorded value is a chain position rather than the
+current tail. `zeus approve` has no journal to compare against; the check runs
+when `--approve` is used or the dossier is denied.
 
 A restore that is not given `--save` parks back into the file it was restored
 from, so a program with several sensitive effects can be resumed one approval
@@ -226,7 +312,10 @@ on the VM's cooperation.
 lineage and checked against the same digest as the approval would have been,
 and kills the machine at the seam rather than resuming it with `-1`: handing a
 refusal to the program as an ordinary result would let it continue past a
-capability it was not granted.
+capability it was not granted. It prints `machine killed` only when the refusal
+reached the journal; if the append fails it says the denial was **NOT
+recorded**, exits 1 and leaves the parked snapshot in place rather than
+destroying the evidence.
 
 ### 3.5 The jail
 
@@ -679,9 +768,14 @@ version 1 files must be reassembled from `.zasm`.
 raw-packet slots (with their ids) and the pending effect. A FNV-1a 64 checksum
 over the whole payload is stored last.
 
-Format 2 has a 14-field u32 header. `yielded` is the single "a pending effect
-exists" bit, and each packet entry carries its slot index, so a fork keeps
-raw-packet ids stable even when a lower slot was freed.
+Format 3 has the same 14-field u32 header as format 2, followed by the binding
+metadata: a 33-byte NUL-padded lineage, the pending `seq` (0 when unbound) and
+the `journal_head` the machine was parked at (0 when unbound). The head is
+validated against the supplied journal on restore and deny: the chain must
+contain the record the machine was parked at, or the run is refused as coming
+from a different journal. `yielded` is the single
+"a pending effect exists" bit, and each packet entry carries its slot index, so
+a fork keeps raw-packet ids stable even when a lower slot was freed.
 
 The reader validates the checksum, both version numbers, and every invariant
 execution relies on: `running` implies `started` and `error == ZEUS_OK`;
@@ -690,9 +784,11 @@ zeroed pending effect; pending buffers and strings lie inside memory; packet
 slots are well formed. Restore is atomic — on failure the destination machine
 is untouched, on success it is replaced wholesale. A lifecycle state is
 preserved exactly: a halted machine stays halted, and a suspended one yields
-the same pending effect on the next step. A typical machine snapshot is about
-132 KiB; a snapshot taken by a different build is refused with "invalid or
-corrupt snapshot".
+the same pending effect on the next step. Writes are atomic — same-directory
+temporary, `fsync`, `rename`, parent-directory `fsync` — so a failed save
+cannot replace a good snapshot with a partial one. A typical machine snapshot
+is about 132 KiB; a snapshot taken by a different build is refused with
+"invalid or corrupt snapshot".
 
 ---
 

@@ -16,6 +16,7 @@ class Obligation:
     expires_at: float            # opened_at + window
     spec_line: int
     correlation: str | None = None   # instance id carried from trigger event
+    spec_source: str | None = None   # fragment file the rule came from
     state: str = "open"          # "open" | "fulfilled" | "bolted"
 
 

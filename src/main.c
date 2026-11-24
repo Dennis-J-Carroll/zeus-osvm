@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,6 +52,7 @@ typedef struct {
     long max_steps;   /* -1 = unlimited */
     bool ask;
     bool allow_raw;
+    bool allow_gap;     /* proceed when journal and dossier seqs disagree */
     bool save_inferred; /* --save was derived, not requested */
 } Options;
 
@@ -65,6 +67,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  %s run-asm <in.zasm> [options]        Assemble and run\n", prog);
     fprintf(stderr, "  %s approve <dossier> [--out F]        Approve the exact machine shown in a dossier\n", prog);
     fprintf(stderr, "  %s deny    <dossier> [--journal F]   Kill a machine at its pending effect\n", prog);
+    fprintf(stderr, "  %s journal verify  <file> [--lineage ID] [--allow-legacy]\n", prog);
+    fprintf(stderr, "  %s journal resolve --journal F --seq N --outcome committed|aborted --reason TEXT\n", prog);
     fprintf(stderr, "  %s jail    [--check] [--no-netns] [--no-seccomp] -- <cmd> [args]\n", prog);
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  --max-steps N   Stop after N instructions and leave the machine suspended\n");
@@ -73,8 +77,10 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --ask           Park the machine for approval before sensitive effects\n");
     fprintf(stderr, "  --approve F     Approval file to check against the pending effect (implies --ask)\n");
     fprintf(stderr, "  --allow-raw     Allow raw-socket effects (default: denied)\n");
+    fprintf(stderr, "  --allow-gap     Act when the journal and a dossier disagree on seq\n");
     fprintf(stderr, "  --lineage ID    Continue an existing audit lineage\n");
     fprintf(stderr, "\nExit codes: 0 ok, 1 error, 3 parked for approval, 4 denied.\n");
+    fprintf(stderr, "A denial that cannot be journaled is exit 1, not 4.\n");
 }
 
 static int parse_options(int argc, char **argv, int start, long default_steps, Options *o) {
@@ -105,6 +111,8 @@ static int parse_options(int argc, char **argv, int start, long default_steps, O
             o->ask = true;
         } else if (strcmp(arg, "--allow-raw") == 0) {
             o->allow_raw = true;
+        } else if (strcmp(arg, "--allow-gap") == 0) {
+            o->allow_gap = true;
         } else if (!o->in) {
             o->in = arg;
         } else if (!o->out) {
@@ -126,8 +134,36 @@ static void build_policy(const Options *o, bool gate, ZeusPolicy *policy) {
     if (gate) zeus_policy_ask_all(policy, false);
 }
 
+/* A parked snapshot names the journal head it was written at. The journal we
+ * were handed must contain that record; otherwise the machine came from a
+ * different audit chain. Later records (start, resolve) are allowed because
+ * the recorded value is a chain position, not the current tail. */
+static bool snapshot_head_is_in_journal(const char *journal,
+                                        const ZeusSnapshotMeta *meta) {
+    if (!journal || !meta || meta->journal_head == 0) return true;
+
+    bool found = false;
+    char why[256];
+    why[0] = '\0';
+    if (!zeus_journal_contains_head(journal, meta->journal_head, &found,
+                                    why, sizeof(why))) {
+        fprintf(stderr, "error: cannot verify journal head: %s\n", why);
+        return false;
+    }
+    if (!found) {
+        fprintf(stderr,
+                "error: snapshot was parked at journal head 0x%016llx, which "
+                "is not in '%s'; refusing to resume a machine from a "
+                "different journal\n",
+                (unsigned long long)meta->journal_head, journal);
+        return false;
+    }
+    return true;
+}
+
 /* Drive a machine under a supervisor. Returns a process exit code. */
-static int run_machine(ZeusVM *vm, const Options *o) {
+static int run_machine(ZeusVM *vm, const Options *o,
+                       const ZeusSnapshotMeta *meta) {
     bool gate = o->ask || o->approve != NULL;
 
     /* Parse --approve once, before the machine runs and before the journal is
@@ -172,6 +208,9 @@ static int run_machine(ZeusVM *vm, const Options *o) {
             fprintf(stderr,
                     "error: journal '%s' is held by another supervisor\n",
                     o->journal);
+        } else if (sup.journal_error[0]) {
+            fprintf(stderr, "error: journal is malformed: %s\n",
+                    sup.journal_error);
         } else {
             fprintf(stderr, "error: cannot open supervisor");
             if (o->journal) fprintf(stderr, " (journal '%s')", o->journal);
@@ -193,6 +232,16 @@ static int run_machine(ZeusVM *vm, const Options *o) {
         return ZEUS_EXIT_ERROR;
     }
 
+    if (!snapshot_head_is_in_journal(o->journal, meta)) {
+        zeus_supervisor_close(&sup);
+        return ZEUS_EXIT_ERROR;
+    }
+
+    /* An approval names one sequence and one effect. It is verified against
+     * the pending effect inside the drive; a spent or stale approval fails
+     * that check and is denied (exit 4). There is deliberately no earlier
+     * gap short-circuit here: --allow-gap is for dossier/parking-file gaps,
+     * not for resurrecting an approval that cannot bind. */
     char why[512] = {0};
     ZeusDriveResult r = zeus_supervisor_drive(&sup, vm, o->max_steps,
                                               why, sizeof(why));
@@ -227,6 +276,18 @@ static int run_machine(ZeusVM *vm, const Options *o) {
         case ZEUS_DRIVE_DENIED:
             fprintf(stderr, "denied: %s\n", why);
             rc = ZEUS_EXIT_DENIED;
+            break;
+
+        /* The effect was cancelled and the machine halted, but the journal
+         * has no record of why. Reporting a recorded denial here would launder
+         * an unproven outcome, so the run fails as an error instead. */
+        case ZEUS_DRIVE_DENY_UNRECORDED:
+            fprintf(stderr, "denied: %s\n", why);
+            fprintf(stderr,
+                    "error: the denial was NOT recorded in the journal; the "
+                    "effect was cancelled but the audit trail has no record "
+                    "of the refusal\n");
+            rc = ZEUS_EXIT_ERROR;
             break;
 
         default:
@@ -275,7 +336,7 @@ static int run_program(const ZeusProgram *prog, const Options *o) {
         return ZEUS_EXIT_ERROR;
     }
 
-    int rc = run_machine(&vm, o);
+    int rc = run_machine(&vm, o, NULL);
     zeus_vm_free(&vm);
     return rc;
 }
@@ -302,7 +363,8 @@ static int cmd_restore(const Options *o) {
     ZeusVM vm;
     zeus_vm_init(&vm);
 
-    ZeusError err = zeus_vm_restore(&vm, o->in);
+    ZeusSnapshotMeta meta;
+    ZeusError err = zeus_vm_restore_ex(&vm, o->in, &meta);
     if (err != ZEUS_OK) {
         fprintf(stderr, "error restoring '%s': %s\n",
                 o->in, zeus_error_string(err));
@@ -310,7 +372,7 @@ static int cmd_restore(const Options *o) {
         return ZEUS_EXIT_ERROR;
     }
 
-    int rc = run_machine(&vm, &opts);
+    int rc = run_machine(&vm, &opts, &meta);
     zeus_vm_free(&vm);
     return rc;
 }
@@ -339,7 +401,8 @@ static int cmd_save(const Options *o) {
  * refusal, the same as deny would give. seq and lineage belong to the journal,
  * so they are checked again when the approval is used. */
 static int load_dossier_machine(const ZeusDossier *d, ZeusVM *vm,
-                                uint64_t *digest) {
+                                uint64_t *digest,
+                                ZeusSnapshotMeta *meta_out) {
     zeus_vm_init(vm);
 
     if (d->snapshot[0] == '\0') {
@@ -347,13 +410,27 @@ static int load_dossier_machine(const ZeusDossier *d, ZeusVM *vm,
         return ZEUS_EXIT_ERROR;
     }
 
-    ZeusError err = zeus_vm_restore(vm, d->snapshot);
+    ZeusSnapshotMeta meta;
+    ZeusError err = zeus_vm_restore_ex(vm, d->snapshot, &meta);
     if (err != ZEUS_OK) {
         fprintf(stderr, "error restoring '%s': %s\n", d->snapshot,
                 zeus_error_string(err));
         zeus_vm_free(vm);
         return ZEUS_EXIT_ERROR;
     }
+
+    /* The snapshot records the audit identity it was parked under. A dossier
+     * naming a different lineage or sequence describes another point in the
+     * chain, so the digest check below would be answering the wrong question. */
+    char why[256];
+    why[0] = '\0';
+    if (!zeus_snapshot_matches_dossier(&meta, d, why, sizeof(why))) {
+        fprintf(stderr, "error: %s\n", why);
+        zeus_vm_free(vm);
+        return ZEUS_EXIT_DENIED;
+    }
+    if (meta_out) *meta_out = meta;
+
     if (!vm->yielded) {
         fprintf(stderr, "error: machine in '%s' has no pending effect\n",
                 d->snapshot);
@@ -383,7 +460,7 @@ static int cmd_approve(const char *dossier_path, const char *out_path) {
 
     ZeusVM vm;
     uint64_t digest;
-    int rc = load_dossier_machine(&d, &vm, &digest);
+    int rc = load_dossier_machine(&d, &vm, &digest, NULL);
     if (rc != ZEUS_EXIT_OK) return rc;
     zeus_vm_free(&vm);
 
@@ -418,7 +495,8 @@ static int cmd_deny(const Options *o) {
     }
     ZeusVM vm;
     uint64_t digest;
-    int rc = load_dossier_machine(&d, &vm, &digest);
+    ZeusSnapshotMeta meta;
+    int rc = load_dossier_machine(&d, &vm, &digest, &meta);
     if (rc != ZEUS_EXIT_OK) return rc;
 
     ZeusPolicy policy;
@@ -430,9 +508,18 @@ static int cmd_deny(const Options *o) {
             fprintf(stderr,
                     "error: journal '%s' is held by another supervisor\n",
                     o->journal);
+        } else if (sup.journal_error[0]) {
+            fprintf(stderr, "error: journal is malformed: %s\n",
+                    sup.journal_error);
         } else {
             fprintf(stderr, "error: cannot open supervisor\n");
         }
+        zeus_vm_free(&vm);
+        return ZEUS_EXIT_ERROR;
+    }
+
+    if (!snapshot_head_is_in_journal(o->journal, &meta)) {
+        zeus_supervisor_close(&sup);
         zeus_vm_free(&vm);
         return ZEUS_EXIT_ERROR;
     }
@@ -441,24 +528,46 @@ static int cmd_deny(const Options *o) {
     ZeusEffectKind kind = vm.pending.kind;
 
     if (seq != d.seq) {
+        if (!o->allow_gap) {
+            fprintf(stderr,
+                    "error: journal continues at seq %llu but the dossier "
+                    "says %llu; refusing to act across a gap (use "
+                    "--allow-gap to override)\n",
+                    (unsigned long long)seq, (unsigned long long)d.seq);
+            zeus_supervisor_close(&sup);
+            zeus_vm_free(&vm);
+            return ZEUS_EXIT_ERROR;
+        }
         fprintf(stderr,
-                "warning: journal continues at seq %llu but the dossier says "
-                "%llu; the audit chain has a gap\n",
+                "warning: journal continues at seq %llu but the dossier "
+                "says %llu; proceeding across the gap because --allow-gap "
+                "was given\n",
                 (unsigned long long)seq, (unsigned long long)d.seq);
     }
 
     bool journaled = zeus_supervisor_deny(&sup, &vm, "operator_denied");
 
-    printf("denied %s seq %llu (digest 0x%016llx); machine killed\n",
-           zeus_effect_name(kind),
-           (unsigned long long)seq, (unsigned long long)digest);
-    if (!journaled) {
-        fprintf(stderr, "warning: denial could not be journaled\n");
+    /* "machine killed" is a claim about the audit chain: the refusal is on
+     * record, so no later approval can spend that seq. When the append failed
+     * the effect is still cancelled, but the operator is told the truth and
+     * the parked snapshot is left where it is: a refusal never destroys the
+     * evidence it could not record. */
+    if (journaled) {
+        printf("denied %s seq %llu (digest 0x%016llx); machine killed\n",
+               zeus_effect_name(kind),
+               (unsigned long long)seq, (unsigned long long)digest);
+    } else {
+        fprintf(stderr,
+                "error: denied %s seq %llu (digest 0x%016llx) but the denial "
+                "was NOT recorded in the journal; the parked machine is "
+                "untouched\n",
+                zeus_effect_name(kind),
+                (unsigned long long)seq, (unsigned long long)digest);
     }
 
     zeus_supervisor_close(&sup);
     zeus_vm_free(&vm);
-    return ZEUS_EXIT_DENIED;
+    return journaled ? ZEUS_EXIT_DENIED : ZEUS_EXIT_ERROR;
 }
 
 static int cmd_asm(const char *src_path, const char *out_path) {
@@ -525,10 +634,136 @@ static int cmd_run_asm(const Options *o) {
     return rc;
 }
 
+/* Journal maintenance. Verify is read-only; resolve closes an unmatched
+ * intent under the same exclusive lock a supervisor would take. */
+static int cmd_journal(int argc, char **argv) {
+    if (argc < 1) {
+        fprintf(stderr, "error: journal needs a subcommand (verify or resolve)\n");
+        return ZEUS_EXIT_ERROR;
+    }
+
+    if (strcmp(argv[0], "verify") == 0) {
+        const char *file = NULL;
+        const char *lineage = NULL;
+        bool allow_legacy = false;
+
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--lineage") == 0) {
+                if (++i >= argc) {
+                    fprintf(stderr, "error: --lineage needs an id\n");
+                    return ZEUS_EXIT_ERROR;
+                }
+                lineage = argv[i];
+            } else if (strcmp(argv[i], "--allow-legacy") == 0) {
+                allow_legacy = true;
+            } else if (!file) {
+                file = argv[i];
+            } else {
+                fprintf(stderr, "error: unexpected argument '%s'\n", argv[i]);
+                return ZEUS_EXIT_ERROR;
+            }
+        }
+        if (!file) {
+            fprintf(stderr, "error: journal verify needs a file\n");
+            return ZEUS_EXIT_ERROR;
+        }
+
+        ZeusJournalVerify v;
+        if (!zeus_journal_verify(file, lineage, allow_legacy, &v)) {
+            /* All scan failures already name the offending line. */
+            fprintf(stderr, "journal verify: %s\n", v.reason);
+            return ZEUS_EXIT_ERROR;
+        }
+        if (v.legacy) {
+            printf("journal verify: ok (%llu records; legacy records present, "
+                   "chain unverified)\n",
+                   (unsigned long long)v.records);
+        } else {
+            printf("journal verify: ok (%llu records, chain verified)\n",
+                   (unsigned long long)v.records);
+        }
+        return ZEUS_EXIT_OK;
+    }
+
+    if (strcmp(argv[0], "resolve") == 0) {
+        const char *journal = NULL;
+        const char *outcome = NULL;
+        const char *reason = NULL;
+        uint64_t seq = 0;
+        bool have_seq = false;
+
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--journal") == 0) {
+                if (++i >= argc) {
+                    fprintf(stderr, "error: --journal needs a path\n");
+                    return ZEUS_EXIT_ERROR;
+                }
+                journal = argv[i];
+            } else if (strcmp(argv[i], "--outcome") == 0) {
+                if (++i >= argc) {
+                    fprintf(stderr, "error: --outcome needs a value\n");
+                    return ZEUS_EXIT_ERROR;
+                }
+                outcome = argv[i];
+            } else if (strcmp(argv[i], "--reason") == 0) {
+                if (++i >= argc) {
+                    fprintf(stderr, "error: --reason needs text\n");
+                    return ZEUS_EXIT_ERROR;
+                }
+                reason = argv[i];
+            } else if (strcmp(argv[i], "--seq") == 0) {
+                if (++i >= argc) {
+                    fprintf(stderr, "error: --seq needs a number\n");
+                    return ZEUS_EXIT_ERROR;
+                }
+                errno = 0;
+                char *end = NULL;
+                unsigned long long v = strtoull(argv[i], &end, 10);
+                if (errno != 0 || !end || *end != '\0') {
+                    fprintf(stderr, "error: --seq '%s' is not a number\n", argv[i]);
+                    return ZEUS_EXIT_ERROR;
+                }
+                seq = (uint64_t)v;
+                have_seq = true;
+            } else {
+                fprintf(stderr, "error: unexpected argument '%s'\n", argv[i]);
+                return ZEUS_EXIT_ERROR;
+            }
+        }
+
+        if (!journal || !outcome || !reason || !have_seq) {
+            fprintf(stderr,
+                    "error: journal resolve needs --journal, --seq, "
+                    "--outcome and --reason\n");
+            return ZEUS_EXIT_ERROR;
+        }
+
+        char why[256];
+        if (!zeus_journal_resolve(journal, seq, outcome, reason,
+                                  why, sizeof(why))) {
+            fprintf(stderr, "error: journal resolve: %s\n", why);
+            return ZEUS_EXIT_ERROR;
+        }
+        printf("resolved seq %llu as %s\n", (unsigned long long)seq, outcome);
+        return ZEUS_EXIT_OK;
+    }
+
+    fprintf(stderr,
+            "error: unknown journal subcommand '%s' (expected verify or "
+            "resolve)\n", argv[0]);
+    return ZEUS_EXIT_ERROR;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         usage(argv[0]);
         return ZEUS_EXIT_ERROR;
+    }
+
+    if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0 ||
+        strcmp(argv[1], "help") == 0) {
+        usage(argv[0]);
+        return ZEUS_EXIT_OK;
     }
 
     Options o;
@@ -570,6 +805,8 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], "deny") == 0) {
         if (parse_options(argc, argv, 2, -1, &o) != 0) { usage(argv[0]); return ZEUS_EXIT_ERROR; }
         return cmd_deny(&o);
+    } else if (strcmp(argv[1], "journal") == 0) {
+        return cmd_journal(argc - 2, argv + 2);
     } else if (strcmp(argv[1], "jail") == 0) {
         return zeus_cmd_jail(argc - 2, argv + 2);
     } else {

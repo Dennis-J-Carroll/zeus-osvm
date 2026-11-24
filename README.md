@@ -60,7 +60,9 @@ than once:
 ```
 
 Restoring the same snapshot twice gives two independent machines. Snapshots
-are versioned and checksummed.
+are versioned and checksummed, written atomically (temporary + `fsync` +
+`rename`), and a parked machine's file records the audit lineage and sequence
+it belongs to, so a dossier cannot be paired with the wrong machine.
 
 ## Protection
 
@@ -69,17 +71,29 @@ natural policy point:
 
 - **Default-deny policy** — console and sockets are allowed; `RAW_*` effects
   need `--allow-raw`. A denied effect halts the machine (exit 4) instead of
-  handing the program a failure result it can ignore.
+  handing the program a failure result it can ignore. If the journal cannot
+  accept the refusal, the effect is still cancelled but the run fails as an
+  error: an unrecorded denial is never reported as a proven one.
 - **Append-only audit** — `--journal F` writes `intent` before each effect and
   `commit` after, with a supervisor-owned sequence number and a digest of the
   resolved operands. The journal is held under an exclusive lock for the life
   of the supervisor, so two processes cannot scan the same counter and mint the
   same number. A crash between intent and commit is refused on every retry: a
-  refused open writes nothing, so the unmatched intent is never erased.
+  refused open writes nothing, so the unmatched intent is never erased. Every
+  record chains to the previous one, so `zeus journal verify` names the first
+  tampered line; `zeus journal resolve` closes an unmatched intent under the
+  same lock instead of hand-editing the file. Malformed records, over-long
+  lines and duplicate/regressed sequences fail loudly, never silently skipped.
+  Journals from older builds without `prev` still open, with one warning that
+  their chain is unverified.
 - **Approval gate** — `--ask` (or `--approve`) parks the machine with the
-  effect pending and writes a dossier; `zeus approve` checks the digest against
-  the snapshot the dossier names, binds `(lineage, seq, digest)` to that exact
-  machine, and `zeus deny` kills it. A
+  effect pending and writes a dossier; `zeus approve` checks the snapshot's own
+  `(lineage, seq)` and the digest against the machine the dossier names, binds
+  `(lineage, seq, digest)` to that exact machine, and `zeus deny` kills it. A
+  journal that has moved past the dossier refuses the mismatch (exit 1) unless
+  `--allow-gap` is given; a supplied approval is checked against the pending
+  effect, so a spent one is a denial (exit 4). A snapshot is only resumable
+  against the journal chain it was parked in. A
   machine with several sensitive effects parks once per effect. A malformed
   approval is an error, not a denial: the parked machine is left untouched.
 - **OS jail** — `zeus jail` adds a network namespace, a uid drop and a seccomp
@@ -89,6 +103,10 @@ natural policy point:
 ./zeus run-asm prog.zasm --ask --save m.zsnap --journal audit.jsonl
 ./zeus approve m.zsnap.dossier
 ./zeus restore m.zsnap --approve m.zsnap.dossier.approve --journal audit.jsonl
+
+./zeus journal verify audit.jsonl
+./zeus journal resolve --journal audit.jsonl --seq 7 \
+    --outcome aborted --reason "worker died before the effect"
 ```
 
 ## Examples
@@ -106,6 +124,11 @@ natural policy point:
 ```bash
 make test
 ```
+
+That is 4/4 VM, 3/3 assembler, 12/12 safety, 14/14 snapshot and 19/19
+protection unit tests, then the 66-check approval flow, the 23-check deny
+proof and the 20-check journal-integrity proof. `make check` reruns the same
+suite under ASan + UBSan.
 
 ## Architecture
 
@@ -144,9 +167,36 @@ python3 -m mo watch  spec.zspec session.jsonl        # judge a growing tap log l
 python3 -m mo report spec.zspec trace.jsonl -o out.html  # render a self-contained HTML timeline
 ```
 
+Specs compose: `INCLUDE fragments/mcp_liveness.zspec` merges another `.zspec`
+at that point (relative to the including file, include-once). Every rule and
+verdict keeps the fragment's file as `spec_source`, so a BOLT names where the
+rule lived; single-file spec output is unchanged. Demo:
+`python3 -m mo.examples.spec_fragments_demo --out fragments.html`.
+
+The real-failure demo needs the `glassport` tap:
+
+```bash
+pip install glassport
+python3 -m mo.examples.real_failure_demo --out real-failure.html
+```
+
 Verdicts go to stdout as JSONL, a human summary to stderr; exit code is `1` if
 anything BOLTED or CONDEMNED, so `mo` works as a CI gate. Run the tests with
-`python3 -m pytest mo/`.
+`python3 -m pytest mo/`; CI runs that suite in a separate `mo` job beside the
+C `make check` job. Live `mo watch` derives its synthetic-tick interval from
+the tightest declared window (100ms ceiling, 5ms floor, poll at half the tick),
+so a short window is not noticed a full default tick late; `--tick-ms`
+overrides it.
+
+Replay determinism is checked statically: the judge core may read time only
+from event timestamps, and `mo/tests/test_determinism.py` fails if any
+`time`/`datetime` access reaches it.
+
+A BOLT keeps `closed_at` as notice-time (the event that revealed the lapse)
+and records the exact window boundary as `detail.lapsed_at`, plus
+`detail.notice_lag_ms`. A late flush therefore cannot make a five-second
+window look like a longer obligation, and the report tooltip shows the window,
+the notice-time duration, the lapse instant and the lag.
 
 ## License
 

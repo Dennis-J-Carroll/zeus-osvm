@@ -122,7 +122,8 @@ A BOLT entry, concretely:
 ```json
 { "kind":"BOLTED", "identifier":"tool_x", "spec_line":14,
   "opened_at":0.0, "closed_at":5001.0,
-  "detail":{ "window_ms":5000, "reason":"liveness_window_expired" } }
+  "detail":{ "window_ms":5000, "reason":"liveness_window_expired",
+              "lapsed_at":5000.0, "notice_lag_ms":1.0 } }
 ```
 
 ---
@@ -189,8 +190,12 @@ Decisions locked while building M0:
   event landing exactly at `opened_at + window` still FULFILLS.
 - **Coverage = unmatched count** (premortem #5). An event counts as *matched* only
   if it fulfills / condemns / triggers; pure expiry-carrier traffic stays unmatched.
-- **BOLT `closed_at` = notice-time** (the event ts that revealed the lapse), not the
-  exact lapse instant. Revisit at M4 if reports need lapse-time.
+- **BOLT `closed_at` = notice-time** (the event ts that revealed the lapse).
+  ✅ Resolved at M4: a lapsed BOLT also records `detail.lapsed_at` (the exact
+  window boundary) and `detail.notice_lag_ms`, so a late flush or coarse tick
+  cannot make a 5s window look like a longer obligation. `closed_at` stays
+  notice-time so the verdict stream remains monotonic.
+  Demo: `python3 -m mo.examples.lapse_time_demo --out lapse.html`.
 
 **M1 — Spec parser. ✅ DONE.** `mo/parser.py` turns `.zspec` text into the same
 TriggerRule/AssertRule objects — engine/ledger/report untouched. Line-oriented
@@ -202,17 +207,27 @@ demo from a text spec; `spec_line` in verdicts points at real source lines.
 Grammar v0 (locked, deliberately small per premortem #3):
 ```
 ; comment to end of line
+INCLUDE <path>
 on <primitive> as $<bind>:
     EXPECT <primitive> for $<bind>
     WINDOW <ms>
 
-ASSERT no <primitiveA> where identifier not in <primitiveB>
+ASSERT no <primitiveA> where identifier not in <primitiveB> [GRACE <ms>]
 ```
 - `on ... as $x:` IS the OBSERVE primitive (block form from §3's worked example).
   One EXPECT + one WINDOW per block; binding `$x` must match across `on`/`EXPECT`.
 - ASSERT v0 is **membership-only**. The "set" is a primitive's seen-identifiers
   (what `engine.seen` already tracks) — no named-set indirection like
   `declared_tools`. Equality/boolean forms deferred until something real needs them.
+- `GRACE <ms>` is the one temporal addition: a violating call opens a pending
+  check; a declaration of the same identifier at or before the deadline resolves
+  it, while a tick, later event, or end-of-stream past the deadline condemns it.
+  It exists for wire-order live mode, not as a general temporal query language.
+- `INCLUDE <path>` composes another `.zspec` at that point, resolved relative
+  to the including file. It is include-once (a diamond adds one copy) and a
+  cycle or missing file is a line-numbered parse error. Rules keep the file
+  they came from as `spec_source`, so a line number stays unambiguous across
+  fragments.
 
 **M2 — Adapter for MCP.** Write the protocol adapter that turns the existing tap
 session logs (`from_mcp_session()` already exists!) into a ZeusEvent stream. This
@@ -237,23 +252,28 @@ Decisions locked while building M3:
   replay determinism (#6) is preserved by construction. clock/sleep/stop are
   injectable so the tick logic is deterministically testable without real time.
 - **Tick ts is on the same scale as frame ts (epoch ms)** so `ev.ts >
-  expires_at` is meaningful. Default tick granularity **100ms** (premortem #1).
+  expires_at` is meaningful. The tick keeps the historical **100ms** ceiling
+  but tightens to one tenth of the tightest declared window (5ms floor, poll
+  coupled) — the §8 measurement decision; `mo watch --tick-ms` overrides it.
 - **One evaluation loop, two faces:** `iter_verdicts()` is the generator;
   `run()` drains it into a RunResult for replay, `watch()` consumes it lazily so
   a BOLT prints mid-session, not at end-of-stream.
 - **Live projection is WIRE ORDER** (`frame_projector`), not declarations-up-
   front like the batch `--mcp` path: live can't pre-scan the session. This means
-  the membership ASSERT is racy against a late `tools/list` (premortem #2's
-  cousin), so the M3 demo spec is liveness-only. Wire-order fabrication checks
-  wait for a correlation/declaration-aware ASSERT (M4+).
+  a membership ASSERT is racy against a late `tools/list` (premortem #2's
+  cousin). The `GRACE <ms>` variant handles it without pre-scanning: a call
+  opens a deferred check, a declaration inside the window resolves it, and a
+  tick/later event/end-of-stream past the deadline condemns it. The
+  pre-delivery gate escalates a pending check rather than allowing an effect it
+  cannot yet clear.
 - **Departed from the literal `-- <mcp server cmd>` exit line:** glassport's tap
   writes a JSONL file (no push API) and needs a real client to drive the server,
   so "read the proxy stream in real time" became *tail the growing tap log* —
   the testable, dogfoodable seam. A `-- <cmd>` launcher can wrap it later.
 
 **M4 — Report. ✅ DONE.** `report.render_html(result)` draws a self-contained,
-no-JS, offline HTML timeline: FULFILLED green spans, BOLTED amber spans,
-CONDEMNED red point-markers, over a linear-time axis, under a CLEAN/DEVIATIONS
+no-JS, offline HTML report: FULFILLED green spans, BOLTED amber spans,
+CONDEMNED red point-markers, in even verdict lanes, under a CLEAN/DEVIATIONS
 banner with the coverage signal. `mo report [--mcp] <spec> <trace> [-o out.html]`.
 44 tests pass.
 *Exit met:* one artifact you can show someone — generated for the §9 fabrication
@@ -265,13 +285,12 @@ Decisions locked while building M4:
   `<img onerror=...>` and the report opens from `file://` where injected script
   runs with local reach — so wire strings render as text, never markup. A test
   pins this with a live XSS-shaped identifier.
-- **Linear time scale** (`_span_geometry`): x is proportional to real elapsed
-  ms, so a BOLT's window genuinely looks wide and clustered calls sit close.
-  **KNOWN LIMITATION:** on a dense session — many calls milliseconds apart next
-  to one multi-second BOLT — the fast calls collapse to a sliver and the report
-  reads badly. The fix is per-event (even-lane) spacing with true durations in
-  tooltips, ~6 lines isolated in `_span_geometry`. Left linear until a real
-  dense session proves it unreadable; swap is local and test-pinned.
+- **Even-lane geometry** (`_span_geometry`): each verdict occupies one lane in
+  verdict order, 72% of the lane width. This replaced the linear time scale
+  after a dense session collapsed millisecond calls beside a six-second BOLT
+  into a sliver. True durations moved into the bar tooltips; the axis labels
+  lanes, not milliseconds, and the session range stays in the subtitle. Pinned
+  by `test_dense_verdicts_use_even_lanes_and_tooltip_durations`.
 - **CONDEMNED is a point marker, not a span** — it has no `opened_at`, so it
   renders at its instant (width 0, red left-border) rather than a bar.
 - **Zero dependencies, single string** — no template engine, inline CSS, opens
@@ -302,6 +321,14 @@ ledger and commits only on `ALLOW`, so a refused effect never enters MO's state.
    obligation and an older one BOLTs spuriously. **Mitigation:** obligations may
    need an instance/correlation id, not just the tool name. Watch for it at M2
    with real traffic.
+   **✅ Mitigated:** both MCP adapters attach the jsonrpc id as `correlation`;
+   an obligation opened by a correlated event only closes on an event with the
+   same id. Matching is scoped to the obligation's own id: a declaration has no
+   instance id, so its obligation accepts the first matching execution rather
+   than vetoing every correlated call. Pinned by
+   `test_concurrent_same_tool_results_close_matching_obligation`,
+   `test_uncorrelated_declaration_obligation_accepts_correlated_call` and
+   `test_declared_tool_honored_by_correlated_call_is_fulfilled`.
 
 3. **ASSERT scope creep.** `ASSERT` predicates are a tiny language that wants to
    grow into a full query DSL. **Mitigation:** cap v0 predicates to
@@ -322,24 +349,48 @@ ledger and commits only on `ALLOW`, so a refused effect never enters MO's state.
 6. **Determinism rot.** The moment any rule consults `wall_clock()` instead of
    `ev.ts`, replay stops reproducing. **Mitigation:** ban wall-clock reads inside
    the engine; inject time only via events/ticks. Make it a lint rule.
+   **✅ Mitigated:** `mo/determinism.py` AST-scans the six judge-core modules and
+   reports every `time`/`datetime`/`timeit` import or call, aliases included.
+   `mo/tests/test_determinism.py` fails the suite on a finding; the CLI and
+   adapters stay outside because that is where live ticks are minted. The proof
+   page is `python3 -m mo.examples.determinism_guard_demo --out proof.html`.
 
 ---
 
 ## 8. Open questions (decide before M2)
 
-- Does an obligation need a correlation id beyond the human identifier? (see
-  premortem #2 — probably yes, defer until real traffic proves it)
-- Tick granularity for live mode. (start 100ms, measure)
+- ~~Does an obligation need a correlation id beyond the human identifier?~~
+  **DECIDED (M2/M4): yes** — adapters attach the jsonrpc id as `correlation`,
+  and only the obligation's own id constrains matching. A declaration's
+  obligation (no instance id) accepts the first matching execution.
+- ~~Tick granularity for live mode.~~ **DECIDED (measured):** 100ms stays the
+  ceiling for ordinary multi-second windows; `watch` tightens the tick to one
+  tenth of the tightest declared window (5ms floor) and shrinks the poll to
+  half the tick (50ms cap), so the worst-case BOLT notice lag is about 10% of
+  the window rather than one fixed tick. Measured on the real tailer with a
+  virtual clock at 20–400 polls/s by
+  `python3 -m mo.examples.tick_granularity_demo`. An idle return also emits
+  one final tick, so a window that lapsed during the last quiet interval is
+  reported as `liveness_window_expired` with an exact `lapsed_at`, not as
+  `session_ended_unresolved`.
 - ~~Should `FULFILLED` even be logged?~~ **DECIDED (M0): yes** — gives coverage
   stats for free; engine logs all three kinds.
-- One spec per server, or composable spec fragments? (start single, design
-  parser so fragments are possible later)
+- ~~One spec per server, or composable spec fragments?~~ **DECIDED (implemented):**
+  composable fragments. A root spec composes shared files with
+  `INCLUDE <path>`, resolved relative to the including file. Inclusion is
+  include-once, so a diamond (two fragments sharing a base) adds one copy of
+  the shared rules rather than two obligations per event; a cycle or missing
+  file is a line-numbered parse error. Every rule, obligation and verdict
+  carries `spec_source`, so a verdict's line number stays unambiguous across
+  files, while single-file specs keep their old JSONL shape and `L<n>` label.
+  Demo: `python3 -m mo.examples.spec_fragments_demo`.
 
-Decided in M0, still open at the margins:
-- **Identifier collisions (premortem #2)** remain unmodeled — `run()` uses
-  first-match by `(primitive, identifier)`. Two concurrent `tool_declared search`
-  open two obligations; the next `tool_called search` closes whichever is still
-  open by list order. Fine for M0; revisit with correlation ids at M2.
+Decided in M0, resolved at M4:
+- **Identifier collisions (premortem #2)** are modeled by `correlation`.
+  An obligation opened by a correlated event demands the same id on its
+  closer; a declaration's obligation is anonymous and accepts the first
+  matching execution. Uncorrelated events still fall back to identifier
+  matching for M0/M1 replay compatibility.
 
 ---
 
@@ -351,3 +402,10 @@ Decided in M0, still open at the margins:
 
 If that demo works, the whole Olympus thesis is real and you build outward. If it
 doesn't, you learn why before betting months on it.
+
+**✅ Verified:** `python3 -m mo.examples.real_failure_demo` starts a real
+`glassport probe` against `mo/examples/unhonored_mcp_server.py` (declares
+`report_export`, never answers it), tails the tap with `mo watch`, and asserts
+exactly one `BOLTED` verdict, `liveness_window_expired`, while glassport is
+still running. The live report is written with `--out`; the demo is
+self-checking and exits non-zero on a missed or end-of-stream BOLT.

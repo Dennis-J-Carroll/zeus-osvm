@@ -1,9 +1,14 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/file.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "zeus.h"
 #include "vm.h"
@@ -13,6 +18,7 @@
 #include "supervisor.h"
 
 #define GUARD_LINEAGE "0123456789abcdef0123456789abcdef"
+#define GUARD_OTHER_LINEAGE "fedcba9876543210fedcba9876543210"
 
 static int tests_run = 0;
 static int tests_failed = 0;
@@ -736,6 +742,512 @@ static int test_approval_rejects_hostile_input(void) {
     return ok;
 }
 
+/* A refusal that cannot be journaled must never be reported as if it were
+ * recorded. The effect is still cancelled at the seam (it must never reach the
+ * host after a failed append), the counter keeps the journal's truth instead of
+ * inventing an outcome, and callers can tell the two cases apart. */
+static int test_unjournaled_denial_is_observable(void) {
+    const char *j = "/tmp/zeus_guard_denyfail.log";
+    const char *snap = "/tmp/zeus_guard_denyfail.zsnap";
+    remove(j);
+    remove(snap);
+
+    ZeusPolicy p;
+    zeus_policy_init(&p, ZEUS_PROFILE_STANDARD);
+    zeus_policy_ask_all(&p, false);
+
+    ZeusProgram prog;
+    ZeusVM vm;
+    if (!build(&prog, &vm, "READ\nHALT\n")) return 0;
+
+    ZeusSupervisor s;
+    if (!zeus_supervisor_open(&s, &p, j, NULL)) return 0;
+    s.ask = true;
+    zeus_supervisor_set_paths(&s, snap);
+
+    char why[256];
+    int ok = (zeus_supervisor_drive(&s, &vm, -1, why, sizeof(why))
+              == ZEUS_DRIVE_NEEDS_APPROVAL);
+    ok = ok && vm.yielded && (zeus_supervisor_next_seq(&s) == 1);
+
+    /* Make the append fail without damaging the real journal: /dev/full
+     * accepts the open and refuses every write. */
+    FILE *real = s.journal;
+    FILE *full = fopen("/dev/full", "a");
+    ok = ok && full != NULL;
+    if (!full) {
+        zeus_supervisor_close(&s);
+        zeus_vm_free(&vm);
+        zeus_program_free(&prog);
+        remove(j);
+        remove(snap);
+        return 0;
+    }
+    s.journal = full;
+
+    bool journaled = zeus_supervisor_deny(&s, &vm, "operator_denied");
+    ok = ok && !journaled;
+    ok = ok && !vm.yielded && (vm.error == ZEUS_ERR_EFFECT);
+    ok = ok && (s.seq == 0);
+    ok = ok && (zeus_supervisor_next_seq(&s) == 1);
+
+    fclose(real);
+    zeus_supervisor_close(&s);
+
+    /* The parked snapshot is evidence: a failed denial must not remove it. */
+    ok = ok && (access(snap, F_OK) == 0);
+    char *txt = slurp(j);
+    ok = ok && txt && (count_substr(txt, "\"event\":\"deny\"") == 0);
+    free(txt);
+
+    /* The drive loop draws the same line for a policy refusal. */
+    ZeusProgram prog2;
+    ZeusVM vm2;
+    if (!build(&prog2, &vm2, "PUSH 1\nPRINT\nHALT\n")) {
+        zeus_vm_free(&vm);
+        zeus_program_free(&prog);
+        remove(j);
+        remove(snap);
+        return 0;
+    }
+
+    ZeusPolicy deny;
+    zeus_policy_init(&deny, ZEUS_PROFILE_DENY_ALL);
+
+    ZeusSupervisor s2;
+    ok = ok && zeus_supervisor_open(&s2, &deny, NULL, NULL);
+    FILE *full2 = fopen("/dev/full", "a");
+    ok = ok && full2 != NULL;
+    if (full2) {
+        s2.journal = full2;
+        ZeusDriveResult r = zeus_supervisor_drive(&s2, &vm2, -1, why,
+                                                  sizeof(why));
+        ok = ok && (r == ZEUS_DRIVE_DENY_UNRECORDED);
+        ok = ok && (strstr(why, "could not be journaled") != NULL);
+        ok = ok && (vm2.error == ZEUS_ERR_EFFECT) && !vm2.yielded;
+        ok = ok && (s2.seq == 0);
+        zeus_supervisor_close(&s2);
+    }
+
+    zeus_vm_free(&vm2);
+    zeus_program_free(&prog2);
+    zeus_vm_free(&vm);
+    zeus_program_free(&prog);
+    remove(j);
+    remove(snap);
+    return ok;
+}
+
+/* A failed append must not leave half a record behind. A file-size limit
+ * clamps write(2), and the clamped fragment used to stay in the journal after
+ * the append was reported as failed: a later scan could read an event and a
+ * seq out of a record the refusal said was never written. */
+static int test_partial_append_is_rolled_back(void) {
+    const char *j = "/tmp/zeus_guard_partial.log";
+    const char *snap = "/tmp/zeus_guard_partial.zsnap";
+    remove(j);
+    remove(snap);
+
+    ZeusPolicy p;
+    zeus_policy_init(&p, ZEUS_PROFILE_STANDARD);
+    zeus_policy_ask_all(&p, false);
+
+    ZeusProgram prog;
+    ZeusVM vm;
+    if (!build(&prog, &vm, "READ\nHALT\n")) return 0;
+
+    ZeusSupervisor s;
+    if (!zeus_supervisor_open(&s, &p, j, NULL)) return 0;
+    s.ask = true;
+    zeus_supervisor_set_paths(&s, snap);
+
+    char why[256];
+    int ok = (zeus_supervisor_drive(&s, &vm, -1, why, sizeof(why))
+              == ZEUS_DRIVE_NEEDS_APPROVAL);
+    ok = ok && vm.yielded;
+
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    FILE *f = fopen(j, "rb");
+    ok = ok && f != NULL;
+    if (f) {
+        ok = ok && fstat(fileno(f), &st) == 0;
+        fclose(f);
+    }
+    off_t before = st.st_size;
+
+    /* Room for the first 40 bytes of the deny record and nothing more. */
+    struct rlimit old, rl;
+    ok = ok && getrlimit(RLIMIT_FSIZE, &old) == 0;
+    rl = old;
+    rl.rlim_cur = (rlim_t)before + 40;
+
+    struct sigaction ign, old_xfsz;
+    memset(&ign, 0, sizeof(ign));
+    ign.sa_handler = SIG_IGN;
+    sigemptyset(&ign.sa_mask);
+    ok = ok && sigaction(SIGXFSZ, &ign, &old_xfsz) == 0;
+    ok = ok && setrlimit(RLIMIT_FSIZE, &rl) == 0;
+
+    bool journaled = zeus_supervisor_deny(&s, &vm, "operator_denied");
+
+    (void)setrlimit(RLIMIT_FSIZE, &old);
+    (void)sigaction(SIGXFSZ, &old_xfsz, NULL);
+
+    ok = ok && !journaled;
+    ok = ok && !vm.yielded && (vm.error == ZEUS_ERR_EFFECT);
+    ok = ok && (s.seq == 0);
+
+    f = fopen(j, "rb");
+    ok = ok && f != NULL;
+    if (f) {
+        ok = ok && fstat(fileno(f), &st) == 0;
+        /* The clamped fragment was rolled back to the last complete record. */
+        ok = ok && (st.st_size == before);
+        fclose(f);
+    }
+    char *txt = slurp(j);
+    ok = ok && txt && (strstr(txt, "\"event\":\"deny\"") == NULL);
+    ok = ok && txt && strlen(txt) > 0 && (txt[strlen(txt) - 1] == '\n');
+    free(txt);
+
+    zeus_supervisor_close(&s);
+    zeus_vm_free(&vm);
+    zeus_program_free(&prog);
+    remove(j);
+    remove(snap);
+    return ok;
+}
+
+/* A dossier may only be paired with a snapshot parked for the same audit
+ * lineage and sequence. Without this check a dossier could name one machine
+ * while its digest is re-evaluated against another. */
+static int test_snapshot_binding_refuses_mismatch(void) {
+    ZeusSnapshotMeta m;
+    ZeusDossier d;
+    memset(&m, 0, sizeof(m));
+    memset(&d, 0, sizeof(d));
+    snprintf(m.lineage, sizeof(m.lineage), "%s", GUARD_LINEAGE);
+    snprintf(d.lineage, sizeof(d.lineage), "%s", GUARD_LINEAGE);
+    m.seq = 7;
+    d.seq = 7;
+
+    char why[256];
+    why[0] = '\0';
+    int ok = zeus_snapshot_matches_dossier(&m, &d, why, sizeof(why));
+    ok = ok && (why[0] == '\0');
+
+    m.seq = 6;
+    why[0] = '\0';
+    ok = ok && !zeus_snapshot_matches_dossier(&m, &d, why, sizeof(why));
+    ok = ok && (strstr(why, "seq") != NULL);
+
+    m.seq = 7;
+    snprintf(m.lineage, sizeof(m.lineage),
+             "fedcba9876543210fedcba9876543210");
+    why[0] = '\0';
+    ok = ok && !zeus_snapshot_matches_dossier(&m, &d, why, sizeof(why));
+    ok = ok && (strstr(why, "lineage") != NULL);
+
+    /* An unbound snapshot cannot stand in for a parked machine. */
+    memset(&m, 0, sizeof(m));
+    why[0] = '\0';
+    ok = ok && !zeus_snapshot_matches_dossier(&m, &d, why, sizeof(why));
+    ok = ok && (strstr(why, "seq") != NULL);
+
+    return ok;
+}
+
+/* The old scanner built a "lineage":"..." needle and ran strstr over the
+ * whole line, so a reason could forge a record for another lineage. The
+ * strict parser only reads top-level fields. */
+static int test_journal_parser_is_record_scoped(void) {
+    const char *j = "/tmp/zeus_guard_scope.log";
+    remove(j);
+
+    ZeusSupervisor seed;
+    zeus_supervisor_init(&seed);
+
+    char line[1024];
+    snprintf(line, sizeof(line),
+             "{\"seq\":0,\"event\":\"start\",\"machine\":\"%s\","
+             "\"lineage\":\"%s\",\"raw\":0}",
+             seed.machine_id, seed.lineage_id);
+    int ok = append_line(j, line);
+
+    /* A deny reason quoting another lineage must not look like a record for
+     * that lineage. */
+    snprintf(line, sizeof(line),
+             "{\"seq\":1,\"event\":\"deny\",\"machine\":\"%s\","
+             "\"lineage\":\"%s\",\"effect\":\"read\","
+             "\"digest\":\"0x0000000000000000\","
+             "\"reason\":\"he said \\\"lineage\\\":\\\"%s\\\"\"}",
+             seed.machine_id, seed.lineage_id, GUARD_OTHER_LINEAGE);
+    ok = ok && append_line(j, line);
+
+    ZeusPolicy p;
+    zeus_policy_init(&p, ZEUS_PROFILE_STANDARD);
+
+    ZeusSupervisor s;
+    ok = ok && zeus_supervisor_open(&s, &p, j, GUARD_OTHER_LINEAGE);
+    ok = ok && (s.seq == 0) && !s.ambiguous;
+    zeus_supervisor_close(&s);
+
+    /* A lineage that contains a quote is not a 32-hex id: the record is a
+     * hard parse error, not another lineage to match. */
+    remove(j);
+    snprintf(line, sizeof(line),
+             "{\"seq\":0,\"event\":\"start\",\"machine\":\"%s\","
+             "\"lineage\":\"%s\",\"raw\":0}",
+             seed.machine_id, seed.lineage_id);
+    ok = ok && append_line(j, line);
+    snprintf(line, sizeof(line),
+             "{\"seq\":0,\"event\":\"start\",\"machine\":\"%s\","
+             "\"lineage\":\"%s\\\"deadbeefdeadbeefdeadbeefdeadbeef\"}",
+             seed.machine_id, GUARD_OTHER_LINEAGE);
+    ok = ok && append_line(j, line);
+
+    ZeusSupervisor bad;
+    ok = ok && !zeus_supervisor_open(&bad, &p, j, NULL);
+    ok = ok && (strstr(bad.journal_error, "lineage") != NULL);
+    ok = ok && !bad.journal_busy;
+
+    /* The id rule is the pre-existing valid_id rule: exactly 32 hex
+     * characters. An 8-hex machine id is not a shorter valid id. The old
+     * scanner never looked at the machine field, so it accepted this; the
+     * strict parser applies the same rule the supervisor already used. */
+    remove(j);
+    snprintf(line, sizeof(line),
+             "{\"seq\":0,\"event\":\"start\",\"machine\":\"deadbeef\","
+             "\"lineage\":\"%s\",\"raw\":0}", seed.lineage_id);
+    ok = ok && append_line(j, line);
+
+    ZeusSupervisor shortid;
+    ok = ok && !zeus_supervisor_open(&shortid, &p, j, NULL);
+    ok = ok && (strstr(shortid.journal_error, "machine") != NULL);
+    ok = ok && (strstr(shortid.journal_error, "32") != NULL);
+    ok = ok && !shortid.journal_busy;
+
+    remove(j);
+    return ok;
+}
+
+static int test_journal_rejects_overlong_record(void) {
+    const char *j = "/tmp/zeus_guard_overlong.log";
+    remove(j);
+
+    ZeusSupervisor seed;
+    zeus_supervisor_init(&seed);
+    char line[512];
+    snprintf(line, sizeof(line),
+             "{\"seq\":0,\"event\":\"start\",\"machine\":\"%s\","
+             "\"lineage\":\"%s\",\"raw\":0}",
+             seed.machine_id, seed.lineage_id);
+    int ok = append_line(j, line);
+
+    FILE *f = fopen(j, "a");
+    ok = ok && f != NULL;
+    if (f) {
+        for (int i = 0; i < 5000; i++) fputc('x', f);
+        ok = ok && fclose(f) == 0;
+    }
+
+    ZeusPolicy p;
+    zeus_policy_init(&p, ZEUS_PROFILE_STANDARD);
+    ZeusSupervisor s;
+    ok = ok && !zeus_supervisor_open(&s, &p, j, NULL);
+    ok = ok && (strstr(s.journal_error, "too long at line 2") != NULL);
+    ok = ok && !s.journal_busy;
+
+    remove(j);
+    return ok;
+}
+
+static int test_journal_verify_catches_flipped_byte(void) {
+    const char *j = "/tmp/zeus_guard_chain.log";
+    const char *bad = "/tmp/zeus_guard_chain_bad.log";
+    remove(j);
+    remove(bad);
+
+    ZeusPolicy p;
+    zeus_policy_init(&p, ZEUS_PROFILE_STANDARD);
+    ZeusProgram prog;
+    ZeusVM vm;
+    if (!build(&prog, &vm, "PUSH 65\nPRINTC\nHALT\n")) return 0;
+
+    ZeusSupervisor s;
+    int ok = zeus_supervisor_open(&s, &p, j, NULL);
+    char why[256];
+    ok = ok && (zeus_supervisor_drive(&s, &vm, -1, why, sizeof(why))
+                == ZEUS_DRIVE_HALTED);
+    zeus_supervisor_close(&s);
+
+    ZeusJournalVerify v;
+    ok = ok && zeus_journal_verify(j, NULL, false, &v);
+    ok = ok && (v.records >= 4) && !v.legacy;
+
+    /* Flip one hex digit of the machine id on line 2. The line stays valid
+     * JSON and a valid id; line 3's prev must expose the change. */
+    FILE *f = fopen(j, "rb");
+    ok = ok && f != NULL;
+    if (!f) {
+        zeus_vm_free(&vm);
+        zeus_program_free(&prog);
+        return 0;
+    }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    rewind(f);
+    char *buf = (char *)malloc((size_t)n + 1);
+    ok = ok && buf != NULL;
+    if (!buf) { fclose(f); zeus_vm_free(&vm); zeus_program_free(&prog); return 0; }
+    ok = ok && fread(buf, 1, (size_t)n, f) == (size_t)n;
+    fclose(f);
+    buf[n] = '\0';
+
+    size_t line2 = 0;
+    int newlines = 0;
+    for (long i = 0; i < n; i++) {
+        if (buf[i] == '\n' && ++newlines == 1) {
+            line2 = (size_t)i + 1;
+            break;
+        }
+    }
+    char *m = line2 ? strstr(buf + line2, "\"machine\":\"") : NULL;
+    ok = ok && m != NULL;
+    if (m) {
+        size_t off = (size_t)(m - buf) + 11;
+        if (off < (size_t)n) buf[off] = (buf[off] == '0') ? '1' : '0';
+        else ok = 0;
+    }
+
+    f = fopen(bad, "wb");
+    ok = ok && f != NULL;
+    if (f) {
+        ok = ok && fwrite(buf, 1, (size_t)n, f) == (size_t)n;
+        ok = ok && fclose(f) == 0;
+    }
+    free(buf);
+
+    ZeusJournalVerify badv;
+    ok = ok && !zeus_journal_verify(bad, NULL, false, &badv);
+    ok = ok && (badv.line == 3);
+    ok = ok && (strstr(badv.reason, "chain break") != NULL);
+
+    zeus_vm_free(&vm);
+    zeus_program_free(&prog);
+    remove(j);
+    remove(bad);
+    return ok;
+}
+
+static int test_journal_resolve_closes_wedge(void) {
+    const char *j = "/tmp/zeus_guard_resolve.log";
+    remove(j);
+
+    ZeusSupervisor seed;
+    zeus_supervisor_init(&seed);
+
+    char line[512];
+    snprintf(line, sizeof(line),
+             "{\"seq\":0,\"event\":\"start\",\"machine\":\"%s\","
+             "\"lineage\":\"%s\"}",
+             seed.machine_id, seed.lineage_id);
+    int ok = append_line(j, line);
+    snprintf(line, sizeof(line),
+             "{\"seq\":1,\"event\":\"intent\",\"machine\":\"%s\","
+             "\"lineage\":\"%s\",\"effect\":\"read\"}",
+             seed.machine_id, seed.lineage_id);
+    ok = ok && append_line(j, line);
+
+    ZeusPolicy p;
+    zeus_policy_init(&p, ZEUS_PROFILE_STANDARD);
+
+    ZeusSupervisor s;
+    ok = ok && zeus_supervisor_open(&s, &p, j, seed.lineage_id);
+    ok = ok && s.ambiguous && (s.ambiguous_seq == 1);
+    zeus_supervisor_close(&s);
+
+    char why[256];
+    ok = ok && zeus_journal_resolve(j, 1, "aborted",
+                                    "crashed before an outcome",
+                                    why, sizeof(why));
+
+    ZeusSupervisor s2;
+    ok = ok && zeus_supervisor_open(&s2, &p, j, seed.lineage_id);
+    ok = ok && !s2.ambiguous && (s2.seq == 1);
+    zeus_supervisor_close(&s2);
+
+    ZeusProgram prog;
+    ZeusVM vm;
+    if (!build(&prog, &vm, "PUSH 65\nPRINTC\nHALT\n")) {
+        remove(j);
+        return 0;
+    }
+    ZeusSupervisor s3;
+    ok = ok && zeus_supervisor_open(&s3, &p, j, seed.lineage_id);
+    ok = ok && (zeus_supervisor_drive(&s3, &vm, -1, why, sizeof(why))
+                == ZEUS_DRIVE_HALTED);
+    ok = ok && (s3.seq == 2);
+    zeus_supervisor_close(&s3);
+
+    why[0] = '\0';
+    ok = ok && !zeus_journal_resolve(j, 1, "aborted", "again",
+                                     why, sizeof(why));
+    ok = ok && (strstr(why, "no open intent") != NULL);
+    ok = ok && !zeus_journal_resolve(j, 2, "committed", "nothing",
+                                     why, sizeof(why));
+    ok = ok && (strstr(why, "no open intent") != NULL);
+
+    char *txt = slurp(j);
+    ok = ok && txt && (count_substr(txt, "\"event\":\"resolve\"") == 1);
+    free(txt);
+
+    zeus_vm_free(&vm);
+    zeus_program_free(&prog);
+    remove(j);
+    return ok;
+}
+
+static int test_journal_rejects_duplicate_seq(void) {
+    const char *j = "/tmp/zeus_guard_dup.log";
+    remove(j);
+
+    ZeusSupervisor seed;
+    zeus_supervisor_init(&seed);
+
+    char line[512];
+    snprintf(line, sizeof(line),
+             "{\"seq\":0,\"event\":\"start\",\"machine\":\"%s\","
+             "\"lineage\":\"%s\"}",
+             seed.machine_id, seed.lineage_id);
+    int ok = append_line(j, line);
+    snprintf(line, sizeof(line),
+             "{\"seq\":1,\"event\":\"intent\",\"machine\":\"%s\","
+             "\"lineage\":\"%s\",\"effect\":\"read\"}",
+             seed.machine_id, seed.lineage_id);
+    ok = ok && append_line(j, line);
+    snprintf(line, sizeof(line),
+             "{\"seq\":1,\"event\":\"commit\",\"machine\":\"%s\","
+             "\"lineage\":\"%s\",\"result\":0,\"error\":0}",
+             seed.machine_id, seed.lineage_id);
+    ok = ok && append_line(j, line);
+    snprintf(line, sizeof(line),
+             "{\"seq\":1,\"event\":\"intent\",\"machine\":\"%s\","
+             "\"lineage\":\"%s\",\"effect\":\"read\"}",
+             seed.machine_id, seed.lineage_id);
+    ok = ok && append_line(j, line);
+
+    ZeusPolicy p;
+    zeus_policy_init(&p, ZEUS_PROFILE_STANDARD);
+    ZeusSupervisor s;
+    ok = ok && !zeus_supervisor_open(&s, &p, j, seed.lineage_id);
+    ok = ok && (strstr(s.journal_error, "duplicate or regressed") != NULL);
+
+    remove(j);
+    return ok;
+}
+
 int main(void) {
     printf("Running protection tests...\n");
     RUN_TEST(test_policy_defaults_to_deny);
@@ -749,6 +1261,14 @@ int main(void) {
     RUN_TEST(test_journal_lock_is_exclusive);
     RUN_TEST(test_dossier_rejects_hostile_input);
     RUN_TEST(test_approval_rejects_hostile_input);
+    RUN_TEST(test_unjournaled_denial_is_observable);
+    RUN_TEST(test_partial_append_is_rolled_back);
+    RUN_TEST(test_snapshot_binding_refuses_mismatch);
+    RUN_TEST(test_journal_parser_is_record_scoped);
+    RUN_TEST(test_journal_rejects_overlong_record);
+    RUN_TEST(test_journal_verify_catches_flipped_byte);
+    RUN_TEST(test_journal_resolve_closes_wedge);
+    RUN_TEST(test_journal_rejects_duplicate_seq);
 
     printf("\n%d/%d tests passed\n", tests_run - tests_failed, tests_run);
     return tests_failed > 0 ? 1 : 0;

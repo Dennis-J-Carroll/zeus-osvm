@@ -1,0 +1,6 @@
+; Real-failure live demo: the server never honors report_export.
+; WINDOW is short so the demo proves a mid-session BOLT in a few seconds.
+
+on tool_called as $tool:
+    EXPECT tool_result for $tool
+    WINDOW 1000

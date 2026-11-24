@@ -184,6 +184,33 @@ def test_frame_projector_keeps_concurrent_same_tool_calls_separate():
     ]
 
 
+def test_declared_tool_honored_by_correlated_call_is_fulfilled():
+    # The canonical declaration->execution spec must pass on real frames: a
+    # tools/list declaration has no jsonrpc id, while every tools/call does.
+    # The call's id must not stop it from honoring its own declaration.
+    spec = parse(
+        "on tool_declared as $tool:\n"
+        "    EXPECT tool_called for $tool\n"
+        "    WINDOW 5000\n"
+        "\n"
+        "ASSERT no tool_called where identifier not in tool_declared\n"
+    )
+    records = [
+        {"dir": "s2c", "ts": "2026-06-09T18:39:29.100000+00:00",
+         "frame": {"id": 1, "result": {"tools": [{"name": "search"}]}}},
+        {"dir": "c2s", "ts": "2026-06-09T18:39:29.300000+00:00",
+         "frame": {"id": 7, "method": "tools/call",
+                   "params": {"name": "search", "arguments": {}}}},
+        {"dir": "s2c", "ts": "2026-06-09T18:39:29.500000+00:00",
+         "frame": {"id": 7, "result": {"content": []}}},
+    ]
+
+    result = run(frames_to_events(records), spec)
+
+    assert [v.kind for v in result.verdicts] == ["FULFILLED"]
+    assert result.verdicts[0].identifier == "search"
+
+
 def test_frame_projector_survives_malformed_tool_call():
     # missing params, missing name, missing id — the projector must not crash
     # and should still surface something for coverage.

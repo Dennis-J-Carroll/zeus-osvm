@@ -2,7 +2,7 @@ CC      ?= gcc
 CFLAGS  ?= -Wall -Wextra -std=c11 -O2 -Iinclude
 LDFLAGS ?=
 
-SRCS := src/zeus.c src/isa.c src/bytecode.c src/vm.c src/net.c src/snapshot.c src/policy.c src/supervisor.c src/jail.c src/asm.c src/disasm.c src/main.c
+SRCS := src/zeus.c src/isa.c src/bytecode.c src/vm.c src/net.c src/snapshot.c src/policy.c src/supervisor.c src/journal.c src/jail.c src/asm.c src/disasm.c src/main.c
 OBJS := $(SRCS:.c=.o)
 LIB_OBJS := $(filter-out src/main.o,$(OBJS))
 
@@ -40,6 +40,8 @@ test: $(TARGET)
 	./tests/test_snapshot
 	./tests/test_guard
 	bash tests/test_ask.sh
+	bash tests/deny_transcript.sh > /dev/null
+	bash tests/journal_transcript.sh > /dev/null
 
 # Full test suite under ASan + UBSan, then a normal rebuild.
 check:

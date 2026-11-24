@@ -20,6 +20,7 @@ class TriggerRule:
     expects: str                 # primitive that satisfies the obligation
     window_ms: float             # WINDOW
     spec_line: int
+    spec_source: str | None = None   # fragment file the rule came from
 
     def fires_on(self, ev: ZeusEvent) -> bool:
         return ev.primitive == self.on_primitive
@@ -35,6 +36,7 @@ class TriggerRule:
             expires_at=ev.ts + self.window_ms,
             spec_line=self.spec_line,
             correlation=ev.correlation,
+            spec_source=self.spec_source,
         )
 
 
@@ -45,9 +47,21 @@ class AssertRule:
     # `seen` maps primitive -> set of identifiers observed so far.
     predicate: Callable[[ZeusEvent, dict], bool]
     detail: dict = field(default_factory=dict)
+    # Optional wire-order grace window. When set, a violation opens a pending
+    # check instead of condemning immediately; a later event of `primitive_b`
+    # with the same identifier resolves it if it arrives by the deadline.
+    # Immediate ASSERTs leave grace_ms/primitive_a/primitive_b unset.
+    grace_ms: float | None = None
+    primitive_a: str | None = None
+    primitive_b: str | None = None
+    spec_source: str | None = None   # fragment file the rule came from
 
     def violated_by(self, ev: ZeusEvent, seen: dict) -> bool:
         return self.predicate(ev, seen)
+
+    @property
+    def deferred(self) -> bool:
+        return self.grace_ms is not None
 
 
 @dataclass
