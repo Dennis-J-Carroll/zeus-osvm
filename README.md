@@ -2,14 +2,16 @@
 
 ![Zeus_osVM logo](assets/logo.jpg)
 
-A fun, educational stack-based virtual machine written in C, designed for experimenting with networking concepts.
+A fun, educational stack-based virtual machine written in C, designed for experimenting with networking concepts — with a suspendable machine, a default-deny effect policy and a hash-chained audit journal.
 
 ## Features
 
 - Stack-based bytecode interpreter with 64-bit words
 - Suspendable machines: `zeus save` / `zeus restore` snapshot the entire ~132 KiB machine, pending effect and all
-- First-class socket opcodes: `SOCK_TCP`, `BIND`, `LISTEN`, `ACCEPT`, `CONNECT`, `SEND`, `RECV`, `CLOSE`
-- Raw packet opcodes: `RAW_ALLOC`, `RAW_SET_PROTO`, `RAW_SET_DST`, `RAW_SET_SRC`, `RAW_SET_PAYLOAD`, `RAW_SEND`, `RAW_RECV`
+- First-class socket opcodes: `SOCK_TCP`, `SOCK_UDP`, `BIND`, `LISTEN`, `ACCEPT`, `CONNECT`, `SEND`, `RECV`, `CLOSE`
+- Raw packet opcodes: `RAW_ALLOC`, `RAW_FREE`, `RAW_SET_PROTO`, `RAW_SET_DST`, `RAW_SET_SRC`, `RAW_SET_PAYLOAD`, `RAW_SEND`, `RAW_RECV`
+- Safety layer: default-deny effect policy, append-only hash-chained audit journal (`zeus journal verify` / `resolve`), `--ask` / `--approve` approval gate, and a Linux `zeus jail` (namespaces, uid drop, seccomp)
+- `mo/`, a Python spec runner that judges agent behaviour against a `.zspec` and returns `FULFILLED`, `BOLTED` or `CONDEMNED`
 - Small assembler (`zasm`) and disassembler (`zdis`)
 - Example programs including an echo server, HTTP server, and raw ping
 
@@ -49,10 +51,10 @@ Disassemble a bytecode file:
 
 ## Suspend and resume
 
-Every external operation is an effect the interpreter yields rather than
-performs, so a stopped machine is just its state. Run a fixed number of
-instructions, write the machine to disk, and pick it up later — possibly more
-than once:
+Every external operation travels the effect path: the interpreter yields a
+request instead of performing it, so a stopped machine is just its state. Run
+a fixed number of instructions, write the machine to disk, and pick it up
+later — possibly more than once:
 
 ```bash
 ./zeus run-asm examples/hello.zasm --max-steps 3 --save m.zsnap
@@ -66,8 +68,11 @@ it belongs to, so a dossier cannot be paired with the wrong machine.
 
 ## Protection
 
-The interpreter never touches the host directly, which makes the effect seam a
-natural policy point:
+On the effect path the interpreter performs no host I/O itself: sockets, raw
+packets, `READ`, `PRINT` and `PRINTC` are yielded as effects and delivered by
+the supervisor, which makes that seam a natural policy point. (`zeus_vm_step`
+still delivers directly; the policy seam belongs to `zeus_vm_exec` /
+`zeus_vm_resume`.)
 
 - **Default-deny policy** — console and sockets are allowed; `RAW_*` effects
   need `--allow-raw`. A denied effect halts the machine (exit 4) instead of
@@ -81,7 +86,10 @@ natural policy point:
   same number. A crash between intent and commit is refused on every retry: a
   refused open writes nothing, so the unmatched intent is never erased. Every
   record chains to the previous one, so `zeus journal verify` names the first
-  tampered line; `zeus journal resolve` closes an unmatched intent under the
+  divergent record: the line whose `prev` no longer matches its predecessor.
+  An edit to the last record has no successor to check it, so the chain proves
+  ordering and continuity, not the final record's contents.
+  `zeus journal resolve` closes an unmatched intent under the
   same lock instead of hand-editing the file. Malformed records, over-long
   lines and duplicate/regressed sequences fail loudly, never silently skipped.
   Journals from older builds without `prev` still open, with one warning that
@@ -133,7 +141,8 @@ suite under ASan + UBSan.
 ## Architecture
 
 - `include/` public headers
-- `src/` VM, assembler, disassembler, and CLI
+- `src/` VM, effect policy, supervisor and journal, jail, assembler, disassembler, and CLI
+- `mo/` Python spec runner (does not import the C VM)
 - `examples/` sample Zeus assembly programs
 - `tests/` C unit tests
 - `assets/` project logo and ASCII boot splash
@@ -150,6 +159,8 @@ See `include/isa.h` for the full instruction set. Common opcodes:
 - Control: `JMP`, `JZ`, `JNZ`, `CALL`, `RET`, `HALT`
 - Memory: `LOAD`, `STORE`, `LOADB`, `STOREB`, `LOADI`, `STOREI`, `LOADBI`, `STOREBI`
 - I/O: `PRINT`, `PRINTC`, `READ`
+- Networking: `SOCK_TCP`, `SOCK_UDP`, `BIND`, `LISTEN`, `ACCEPT`, `CONNECT`, `SEND`, `RECV`, `CLOSE`
+- Raw packets: `RAW_ALLOC`, `RAW_FREE`, `RAW_SET_PROTO`, `RAW_SET_DST`, `RAW_SET_SRC`, `RAW_SET_PAYLOAD`, `RAW_SEND`, `RAW_RECV`
 
 ## MO — the Mount Olympus spec runner
 
@@ -158,14 +169,23 @@ agent's behavior against a declared `.zspec`: tracks open obligations, fires
 verdicts — `FULFILLED`, `BOLTED` (a liveness window lapsed), `CONDEMNED` (a
 safety assertion broke). See [`MO_PLAN.md`](MO_PLAN.md) for the design.
 
-Four ways to run it:
+Five ways to run it:
 
 ```bash
 python3 -m mo eval   spec.zspec trace.jsonl          # replay a recorded ZeusEvent stream
 python3 -m mo eval   --mcp spec.zspec session.jsonl  # replay a captured Glassport MCP tap log
 python3 -m mo watch  spec.zspec session.jsonl        # judge a growing tap log live (ticks expire silent windows)
+python3 -m mo watch  --log-dir tap spec.zspec -- \
+    glassport wrap --log-dir tap -- python server.py  # launch the tap and judge it in one command
 python3 -m mo report spec.zspec trace.jsonl -o out.html  # render a self-contained HTML timeline
 ```
+
+With `--log-dir DIR` and a command after `--`, MO snapshots the directory,
+starts the command in its own process group, waits for the session log it
+creates, and tails that log live. When the child exits, a short grace poll
+drains its last records; when the judge stops first, the whole child group is
+terminated. A missing log is exit 2, and a child that fails is a deviation
+(exit 1). Demo: `python3 -m mo.examples.watch_launcher_demo`.
 
 Specs compose: `INCLUDE fragments/mcp_liveness.zspec` merges another `.zspec`
 at that point (relative to the including file, include-once). Every rule and

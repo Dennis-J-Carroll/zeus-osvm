@@ -213,7 +213,9 @@ record silently skipped.
 ```
 
 `journal verify` walks the hash chain and the per-lineage sequence accounting,
-prints the first divergent line and what broke, and exits 1 on a break. A
+prints the first divergent line and what broke, and exits 1 on a break. The
+chain proves ordering and continuity: an edit to the last record has no
+successor whose `prev` could disagree, so verify cannot detect one. A
 legacy journal is refused unless `--allow-legacy` is given; with it, verify
 exits 0 but still reports the chain as unverified.
 

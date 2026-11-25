@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import sys
+import time
 
 from mo.cli import load_spec, main, watch
 
@@ -358,3 +360,125 @@ def test_eval_reports_the_fragment_file_for_an_included_rule(tmp_path, capsys):
     bolt = verdicts[0]
     assert bolt["spec_source"].endswith("frag.zspec")
     assert bolt["spec_line"] == 1
+
+
+def _launcher_spec(tmp_path, window_ms=100):
+    spec = tmp_path / "live.zspec"
+    spec.write_text(
+        "on tool_called as $t:\n"
+        "    EXPECT tool_result for $t\n"
+        f"    WINDOW {window_ms}\n"
+    )
+    return spec
+
+
+def _launcher_server(tmp_path, log_dir, *, sleep_s=0.5, rc=0):
+    script = tmp_path / "server.py"
+    script.write_text(
+        "import json, sys, time\n"
+        "from pathlib import Path\n"
+        f"log = Path({str(log_dir)!r}) / 'session_child.jsonl'\n"
+        "log.write_text(json.dumps({\n"
+        "    'dir': 'c2s', 'seq': 1,\n"
+        "    'frame': {'id': 7, 'method': 'tools/call',\n"
+        "              'params': {'name': 'ghost', 'arguments': {}}},\n"
+        "}) + '\\n', encoding='utf-8')\n"
+        f"time.sleep({sleep_s})\n"
+        f"sys.exit({rc})\n"
+    )
+    return script
+
+
+def test_watch_launcher_discovers_the_new_log_and_bolts(tmp_path, capsys):
+    # M3's deferred `-- <cmd>` launcher: start the tap, find the session log it
+    # creates, tail it live, and stop the child when judging ends.
+    spec = _launcher_spec(tmp_path)
+    log_dir = tmp_path / "tap"
+    log_dir.mkdir()
+    script = _launcher_server(tmp_path, log_dir)
+
+    started = time.monotonic()
+    code = main([
+        "watch", "--log-dir", str(log_dir), "--wait-ms", "2000",
+        "--tick-ms", "10", str(spec), "--", sys.executable, str(script),
+    ])
+    elapsed = time.monotonic() - started
+    captured = capsys.readouterr()
+    verdicts = [json.loads(line) for line in captured.out.splitlines()
+                if line.strip()]
+
+    assert code == 1
+    assert [v["kind"] for v in verdicts] == ["BOLTED"]
+    assert verdicts[0]["identifier"] == "ghost"
+    assert verdicts[0]["detail"]["reason"] == "liveness_window_expired"
+    assert "# launched:" in captured.err
+    assert "# tap:" in captured.err and "session_child.jsonl" in captured.err
+    assert elapsed < 5.0
+
+
+def test_watch_launcher_requires_log_dir_and_a_command(tmp_path, capsys):
+    spec = _launcher_spec(tmp_path)
+
+    code = main(["watch", str(spec), "--", sys.executable, "-c", "pass"])
+    err = capsys.readouterr().err
+
+    assert code == 2
+    assert "--log-dir" in err
+
+
+def test_watch_launcher_reports_a_missing_session_log(tmp_path, capsys):
+    spec = _launcher_spec(tmp_path)
+    log_dir = tmp_path / "tap"
+    log_dir.mkdir()
+
+    code = main([
+        "watch", "--log-dir", str(log_dir), "--wait-ms", "100",
+        str(spec), "--", sys.executable, "-c", "pass",
+    ])
+    err = capsys.readouterr().err
+
+    assert code == 2
+    assert "no new *.jsonl" in err
+
+
+def test_watch_launcher_surfaces_a_failing_child(tmp_path, capsys):
+    spec = _launcher_spec(tmp_path)
+    log_dir = tmp_path / "tap"
+    log_dir.mkdir()
+    script = _launcher_server(tmp_path, log_dir, sleep_s=0.1, rc=7)
+
+    code = main([
+        "watch", "--log-dir", str(log_dir), "--wait-ms", "2000",
+        "--tick-ms", "10", str(spec), "--", sys.executable, str(script),
+    ])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "exited 7" in captured.err
+
+
+def test_watch_launcher_killing_a_long_child_is_not_a_failure(tmp_path, capsys):
+    # `--idle-ms` ends judging while the child is still running. MO terminates
+    # the child group; that SIGTERM is cleanup, not a child failure, so a clean
+    # session exits 0 instead of inheriting -15.
+    spec = tmp_path / "clean.zspec"
+    spec.write_text(
+        "on tool_declared as $t:\n"
+        "    EXPECT tool_called for $t\n"
+        "    WINDOW 5000\n"
+    )
+    log_dir = tmp_path / "tap"
+    log_dir.mkdir()
+    script = _launcher_server(tmp_path, log_dir, sleep_s=30.0)
+
+    started = time.monotonic()
+    code = main([
+        "watch", "--log-dir", str(log_dir), "--wait-ms", "2000",
+        "--idle-ms", "150", str(spec), "--", sys.executable, str(script),
+    ])
+    elapsed = time.monotonic() - started
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "exited" not in captured.err
+    assert elapsed < 5.0

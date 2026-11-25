@@ -84,3 +84,10 @@ Kimi Look
    `file: line N` errors. `spec_source` rides every rule, obligation and
    verdict, so a BOLT names the fragment it came from; single-file JSONL is
    unchanged. Demo: `python3 -m mo.examples.spec_fragments_demo`.
+ - One-command live launcher (M3 deferred `-- <cmd>`). ✅ DONE —
+   `mo watch --log-dir DIR <spec> -- <command...>` snapshots the directory,
+   starts the command in its own process group, waits for the new `*.jsonl`,
+   tails it live, and terminates the child group when judging ends. A missing
+   log is exit 2 and a failing child is exit 1; a real `glassport probe` through
+   it produced one live BOLT on `report_export`. Demo:
+   `python3 -m mo.examples.watch_launcher_demo`.

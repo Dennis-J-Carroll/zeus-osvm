@@ -2,6 +2,7 @@
 
     mo eval  <spec.zspec|spec.py> <trace.jsonl>   replay a recorded stream
     mo watch <spec.zspec|spec.py> <session.jsonl> judge a glassport tap log live
+    mo watch --log-dir DIR <spec> -- <cmd...>    launch the tap and judge it in one command
 
 `.zspec` files are parsed by the M1 text parser. `.py` files (M0 form) are
 imported and must define a module-level `spec` (a rules.Spec). Both resolve
@@ -14,8 +15,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import signal
+import subprocess
 import sys
 import time
+from pathlib import Path
 
 from .engine import RunResult, iter_verdicts, run
 from .parser import ParseError
@@ -107,6 +112,112 @@ def _watch(spec_path: str, session_path: str, idle_ms: float | None,
     return 1 if deviations else 0
 
 
+def _new_log(log_dir: str, before: set[str], wait_ms: float) -> str | None:
+    """Wait for a tap session log that the launched process creates.
+
+    Glassport names its session log after the child (`<stamp>_<name>_<pid>.jsonl`),
+    so the path is not knowable before launch. Snapshot the directory, start the
+    command, then take the newest new `*.jsonl` — exactly the retry loop the
+    real-failure demo used by hand.
+    """
+    deadline = time.monotonic() + wait_ms / 1000.0
+    directory = Path(log_dir)
+    while True:
+        candidates = [p for p in directory.glob("*.jsonl")
+                      if str(p) not in before]
+        if candidates:
+            return str(max(candidates, key=lambda p: p.stat().st_mtime_ns))
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.02)
+
+
+def _stop_child(child: subprocess.Popen) -> None:
+    """Terminate the launched process group, then wait for it."""
+    if child.poll() is not None:
+        child.wait()
+        return
+    try:
+        os.killpg(os.getpgid(child.pid), signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        child.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(child.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+
+
+def _watch_command(spec_path: str, command: list[str], log_dir: str,
+                   idle_ms: float | None, tick_ms: float | None,
+                   wait_ms: float) -> int:
+    """`mo watch --log-dir DIR <spec> -- <command...>`: tap and judge together.
+
+    The command is started in its own session (so abandoning the judge also
+    stops its children), and its new session log is tailed as usual. When the
+    command exits, a short grace poll drains the last records before the judge
+    finalises; when the judge stops first, the command tree is terminated.
+    """
+    spec = load_spec(spec_path)
+    if not Path(log_dir).is_dir():
+        print(f"mo: --log-dir {log_dir} is not a directory", file=sys.stderr)
+        return 2
+
+    before = {str(p) for p in Path(log_dir).glob("*.jsonl")}
+    print(f"# launched: {' '.join(command)}", file=sys.stderr)
+    try:
+        child = subprocess.Popen(command, start_new_session=True)
+    except (OSError, ValueError) as exc:
+        print(f"mo: cannot launch {command[0]}: {exc}", file=sys.stderr)
+        return 2
+
+    exited_at: float | None = None
+
+    def stop() -> bool:
+        # After the child exits, keep reading for a short grace window so its
+        # final flushed records are judged; then stop and finalise.
+        nonlocal exited_at
+        if child.poll() is None:
+            exited_at = None
+            return False
+        now = time.monotonic()
+        if exited_at is None:
+            exited_at = now
+            return False
+        return now - exited_at >= 0.2
+
+    child_was_running = True
+    try:
+        print(f"# waiting for a new session log in {log_dir}", file=sys.stderr)
+        log_path = _new_log(log_dir, before, wait_ms)
+        if log_path is None:
+            print(
+                f"mo: no new *.jsonl appeared in {log_dir} within {wait_ms:.0f}ms",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"# tap: {log_path}", file=sys.stderr)
+        result = watch(spec, log_path, idle_ms=idle_ms, tick_ms=tick_ms,
+                       stop=stop)
+    except KeyboardInterrupt:
+        print("mo: interrupted", file=sys.stderr)
+        return 130
+    finally:
+        # Only a child that exited on its own can be judged as failing; a
+        # termination MO performed because judging ended is not its failure.
+        child_was_running = child.poll() is None
+        _stop_child(child)
+
+    deviations = sum(1 for v in result.verdicts if v.kind in ("BOLTED", "CONDEMNED"))
+    child_failed = not child_was_running and child.returncode not in (0, None)
+    if child_failed:
+        print(f"mo: {command[0]} exited {child.returncode}", file=sys.stderr)
+    return 1 if deviations or child_failed else 0
+
+
 def _report(spec_path: str, trace_path: str, mcp: bool, out_path: str | None) -> int:
     spec = load_spec(spec_path)
     if mcp:
@@ -134,6 +245,8 @@ _USAGE = (
     "usage:\n"
     "  mo eval   [--mcp] <spec.zspec|spec.py> <trace.jsonl>\n"
     "  mo watch  [--idle-ms N] [--tick-ms MS] <spec.zspec|spec.py> <session.jsonl>\n"
+    "  mo watch  [--idle-ms N] [--tick-ms MS] [--wait-ms MS] --log-dir DIR\n"
+    "            <spec.zspec|spec.py> -- <command...>\n"
     "  mo report [--mcp] <spec.zspec|spec.py> <trace.jsonl> [-o out.html]"
 )
 
@@ -157,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
         if cmd == "watch":
             idle_ms: float | None = None
             tick_ms: float | None = None
+            wait_ms = 5000.0
+            log_dir: str | None = None
             if "--idle-ms" in rest:
                 i = rest.index("--idle-ms")
                 idle_ms = float(rest[i + 1])
@@ -165,6 +280,37 @@ def main(argv: list[str] | None = None) -> int:
                 i = rest.index("--tick-ms")
                 tick_ms = float(rest[i + 1])
                 rest = rest[:i] + rest[i + 2:]
+            if "--wait-ms" in rest:
+                i = rest.index("--wait-ms")
+                wait_ms = float(rest[i + 1])
+                rest = rest[:i] + rest[i + 2:]
+            if "--log-dir" in rest:
+                i = rest.index("--log-dir")
+                log_dir = rest[i + 1]
+                rest = rest[:i] + rest[i + 2:]
+
+            if "--" in rest:
+                i = rest.index("--")
+                command = rest[i + 1:]
+                spec_args = rest[:i]
+                if len(spec_args) != 1 or not command:
+                    print(_USAGE, file=sys.stderr)
+                    return 2
+                if log_dir is None:
+                    print(
+                        "mo: watch -- <cmd> needs --log-dir DIR so the new "
+                        "session log can be found",
+                        file=sys.stderr,
+                    )
+                    return 2
+                return _watch_command(spec_args[0], command, log_dir,
+                                      idle_ms, tick_ms, wait_ms)
+
+            if log_dir is not None:
+                # A log dir only means something when MO starts the process.
+                print("mo: --log-dir requires a command after --",
+                      file=sys.stderr)
+                return 2
             if len(rest) != 2:
                 print(_USAGE, file=sys.stderr)
                 return 2

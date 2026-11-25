@@ -237,7 +237,9 @@ is where MO meets your existing Glassport work.
 **M3 — Live mode. ✅ DONE.** MO tails a *growing* glassport session log and
 judges it in real time, minting a synthetic `tick` so liveness windows expire
 during silence (premortem #1). `mo watch [--idle-ms N] <spec> <session.jsonl>`
-streams verdicts to stdout the instant each fires. 40 tests pass.
+streams verdicts to stdout the instant each fires; the deferred launcher form
+`mo watch --log-dir DIR <spec> -- <command...>` starts the tap itself and tails
+the session log it creates. 40 tests pass at M3 (112 in the suite today).
 *Exit met:* a hung server (calls a tool, never answers) yields exactly one BOLT
 with reason `liveness_window_expired` — proven on both a static log and a file
 appended-to live while MO tails it.
@@ -269,7 +271,11 @@ Decisions locked while building M3:
 - **Departed from the literal `-- <mcp server cmd>` exit line:** glassport's tap
   writes a JSONL file (no push API) and needs a real client to drive the server,
   so "read the proxy stream in real time" became *tail the growing tap log* —
-  the testable, dogfoodable seam. A `-- <cmd>` launcher can wrap it later.
+  the testable, dogfoodable seam. The deferred `-- <cmd>` launcher now wraps it:
+  with `--log-dir DIR`, MO snapshots the directory, starts the command in its
+  own process group, waits for the new `*.jsonl`, and stops the child group when
+  judging ends (child failure exit 1, missing log exit 2). Demo:
+  `python3 -m mo.examples.watch_launcher_demo`.
 
 **M4 — Report. ✅ DONE.** `report.render_html(result)` draws a self-contained,
 no-JS, offline HTML report: FULFILLED green spans, BOLTED amber spans,

@@ -17,9 +17,11 @@ struct ZeusNetState;
 /*
  * Effects
  * -------
- * The interpreter never blocks and never touches the host. Every external
- * operation becomes a ZeusEffect: a fully self-describing request that the
- * caller satisfies and hands back as an int64_t result.
+ * The interpreter never blocks. On the effect path it performs no I/O itself:
+ * every external operation becomes a ZeusEffect, a fully self-describing
+ * request that the caller satisfies and hands back as an int64_t result.
+ * (`zeus_vm_step` satisfies it inline through the built-in handler; the
+ * exec/resume seam lets a caller apply policy before delivery.)
  *
  * That is what makes the machine suspendable: a stopped machine is just its
  * registers plus the pending effect, and both are snapshot-safe.

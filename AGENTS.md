@@ -95,7 +95,7 @@ Raw packet opcodes create IP-layer raw sockets. On Linux this requires `CAP_NET_
 - **Accounting is supervisor-owned:** the effect counter, `machine_id`/`lineage_id` and the journal live outside the machine, so a snapshot cannot rewind them. `intent` is fsynced before delivery; an unmatched intent makes the next run on that lineage refuse to start, and a refused open writes nothing, so every retry keeps refusing. An append is a single `write(2)`; a short or failed one is rolled back to the last complete record, so a refusal reported as unrecorded leaves no fragment behind. Every record starts with `prev`, the FNV-1a hash of the previous record (0 for the first), so `journal verify` names the first divergent line; legacy records without `prev` still load, but open warns once and verify requires `--allow-legacy`. Parsing is record-scoped and fails loudly on malformed records, lines over 4096 bytes, chain breaks and duplicate/regressed seqs. `journal resolve` closes an open intent under the same lock and spends its seq.
 - **Approval binds the machine, not the file:** an approval is `(lineage, seq, digest)` and the digest covers resolved operands, including buffer contents. `zeus approve` re-checks the dossier against the snapshot it names and `--approve` is verified against the loaded machine; one approval authorises one effect; the snapshot's own `(lineage, seq)` must agree with the dossier before its digest is trusted, and a journal whose next sequence number disagrees with a dossier is exit 1 unless `--allow-gap` is given, while a supplied approval is always checked against the pending effect and a spent/stale approval is a denial (exit 4), not a gap override; `--ask` and `--approve` both imply the gate and need `--journal` (a restore without `--save` parks back into the file it came from, so several sensitive effects park one at a time). A refusal spends its sequence number, so a denied effect cannot later be approved under the same seq. Approval and dossier files are parsed strictly — a truncated line, a duplicate key or an oversized value is exit 1 and leaves the parked machine untouched, not a refusal.
 - **Networking is single-threaded + blocking.** No select/poll loop yet.
-- **Sockets:** both `SOCK_TCP` and `SOCK_UDP` (`0x71`) opcodes exist; README only highlights TCP.
+- **Sockets:** both `SOCK_TCP` and `SOCK_UDP` (`0x71`) opcodes exist.
 
 ## MO — spec runner (Python sibling)
 
@@ -107,6 +107,8 @@ lapsed), `CONDEMNED` (safety assertion broke). Design in `MO_PLAN.md`.
 python3 -m mo eval   spec.zspec trace.jsonl              # replay a recorded ZeusEvent stream
 python3 -m mo eval   --mcp spec.zspec session.jsonl      # replay a captured Glassport MCP tap log
 python3 -m mo watch  spec.zspec session.jsonl            # judge a growing tap log live (synthetic ticks expire silent windows)
+python3 -m mo watch  --log-dir tap spec.zspec -- glassport wrap --log-dir tap -- python server.py
+                                                         # launch the tap and judge it in one command
 python3 -m mo report spec.zspec trace.jsonl -o out.html  # self-contained HTML timeline
 ```
 
@@ -124,11 +126,16 @@ python3 -m mo report spec.zspec trace.jsonl -o out.html  # self-contained HTML t
 
 ## Verified Working
 
-`make` builds all three binaries; `make test` passes 4/4 + 3/3 + 12/12 + 14/14 + 19/19 (VM, assembler, safety, snapshot, protection) plus the 66-check `tests/test_ask.sh` approval flow, the 23-check `tests/deny_transcript.sh` deny proof and the 20-check `tests/journal_transcript.sh` integrity proof; `make check` passes under ASan + UBSan. `make smoke` passes 8/8. `hello`, `echo_server`, `http_server`, `boot_splash` examples run; `raw_ping` needs `CAP_NET_RAW`/root and `--allow-raw`. MO: `python3 -m pytest mo/` passes 107, 2 skipped (the live dogfood is marked `slow`). `zeus jail --check` reports seccomp working (raw sockets denied with EPERM); the namespace layer depends on the host allowing unprivileged user namespaces and fails closed when it does not.
+`make` builds all three binaries; `make test` passes 4/4 + 3/3 + 12/12 + 14/14 + 19/19 (VM, assembler, safety, snapshot, protection) plus the 66-check `tests/test_ask.sh` approval flow, the 23-check `tests/deny_transcript.sh` deny proof and the 20-check `tests/journal_transcript.sh` integrity proof; `make check` passes under ASan + UBSan. `make smoke` passes 8/8. `hello`, `echo_server`, `http_server`, `boot_splash` examples run; `raw_ping` needs `CAP_NET_RAW`/root and `--allow-raw`. MO: `python3 -m pytest mo/` passes 112, 2 skipped (the live dogfood is marked `slow`). `zeus jail --check` reports seccomp working (raw sockets denied with EPERM); the namespace layer depends on the host allowing unprivileged user namespaces and fails closed when it does not.
 
 Recent additions:
 - Correlation ids: `ZeusEvent` and `Obligation` carry a `correlation` field so
   concurrent calls to the same tool close the right obligation (premortem #2).
+- Live launcher: `mo watch --log-dir DIR <spec> -- <command...>` starts the
+  tap, discovers the new session log, tails it, and terminates the child group
+  when judging ends (child failure is exit 1, missing log exit 2). A real
+  `glassport probe` through it produced one live BOLT on `report_export`.
+  Demo: `python3 -m mo.examples.watch_launcher_demo`.
 - Live dogfood verified: `glassport wrap -- python3 fake_server.py` + `mo watch`
   on the growing tap log produced one `FULFILLED` verdict and no deviations.
 - Real-failure demo: `python3 -m mo.examples.real_failure_demo` uses a real
