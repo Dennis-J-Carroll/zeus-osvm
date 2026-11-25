@@ -215,8 +215,8 @@ out "$PARK
 [exit $PARK_RC]"
 expect 'park exits 3' 3 "$PARK_RC"
 
-cmd "./zeus run-asm p.zasm --journal other.jsonl"
-./zeus run-asm "$PROG" --journal "$OTHERJ" >/dev/null 2>&1
+cmd "./zeus run-asm p.zasm --journal other.jsonl < /dev/null"
+./zeus run-asm "$PROG" --journal "$OTHERJ" < /dev/null >/dev/null 2>&1
 
 cmd "./zeus restore snap-a.zsnap --journal other.jsonl"
 DIFF="$(./zeus restore "$SNAP" --journal "$OTHERJ" 2>&1)"

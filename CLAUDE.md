@@ -8,7 +8,7 @@ Stack-based VM in C for experimenting with networking concepts. Builds `zeus` (V
 - Test: `make test`
 - Sanitizers: `make check` (ASan + UBSan over the whole suite, then a normal rebuild)
 - Smoke test: `make smoke` (builds + runs `./smoke_test.sh` end-to-end against all examples)
-- Clean: `make clean` (also removes `examples/*.zeus` and the `zasm`/`zdis` wrappers)
+- Header deps & stdin: the Makefile compiles with `-MMD -MP` and includes `src/*.d`, so editing a header rebuilds exactly the objects that include it (`.d` files are git-ignored and removed by `make clean`). `make test` runs with stdin closed, so a `READ` effect gets EOF instead of blocking.
 
 ## CLI (src/main.c)
 

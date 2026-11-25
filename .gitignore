@@ -1,5 +1,6 @@
 # Build artifacts
 *.o
+*.d
 zeus
 zasm
 zdis

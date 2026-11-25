@@ -13,6 +13,11 @@
 set -u
 cd "$(dirname "$0")/.."
 
+# Nothing here prompts the operator: the pending READ is approved and then
+# delivered, so it must see EOF rather than inherit a terminal. Taking stdin
+# out of the equation keeps `make test` non-blocking however it is invoked.
+exec < /dev/null
+
 PROG=/tmp/zeus_ask_prog.zasm
 JOURNAL=/tmp/zeus_ask_journal.log
 SNAP=/tmp/zeus_ask.zsnap
